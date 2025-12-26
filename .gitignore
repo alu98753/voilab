@@ -236,3 +236,6 @@ video/demos/*
 *.JPG
 
 AsiaDragon_*
+datasets/*
+checkpoints/*
+demos/*
