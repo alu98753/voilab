@@ -239,3 +239,6 @@ AsiaDragon_*
 datasets/*
 checkpoints/*
 demos/*
+# extra
+wandb/
+data/

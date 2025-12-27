@@ -2,7 +2,7 @@
 00_process_video:
   instance: "umi.services.video_organization.VideoOrganizationService"
   config:
-    session_dir: "video"
+    session_dir: "/mnt/zi/00_course/voilab/AsiaDragon_All_285"
     input_patterns: ["*.MP4", "*.mp4"]
   
 01_extract_gopro_imu:
@@ -59,7 +59,7 @@
   instance: "umi.services.frame_to_pose.FrameToPoseService"
   inherit_config: true
   config:
-    task: "living_room"
+    task: "kitchen"
     marker_size_m: 0.018
     intrinsics_path: "defaults/calibration/gopro13_intrinsics_2_7k.json"
     dataset_plan_filename: dataset_plan.pkl
