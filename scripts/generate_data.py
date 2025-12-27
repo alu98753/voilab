@@ -20,6 +20,8 @@ import sys
 import zarr
 from zarr.storage import ZipStore
 from numcodecs import Blosc
+import cv2
+from typing import Optional
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--task", type=str, choices=["kitchen", "dining-room", "living-room"], required=True)
@@ -238,31 +240,117 @@ def get_end_effector_pos_quat_wxyz(panda, lula_solver, art_kine_solver):
 
 
 def save_multi_episode_dataset(output_path: str, episodes: list[dict]) -> None:
+    """
+    Save multiple episodes to zarr zip file with memory-efficient batch processing.
+    """
+    print(f"[SAVE] Starting to save {len(episodes)} episodes to {output_path}")
+    
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
     store = ZipStore(output_path, mode="w")
     root = zarr.group(store)
     data = root.create_group("data")
 
-    rgb = np.concatenate([ep["rgb"] for ep in episodes], axis=0).astype(np.uint8)
-    demo_start = np.concatenate([ep["demo_start"] for ep in episodes], axis=0).astype(np.float64)
-    demo_end = np.concatenate([ep["demo_end"] for ep in episodes], axis=0).astype(np.float64)
-    eef_pos = np.concatenate([ep["eef_pos"] for ep in episodes], axis=0).astype(np.float32)
-    eef_rot = np.concatenate([ep["eef_rot"] for ep in episodes], axis=0).astype(np.float32)
-    gripper = np.concatenate([ep["gripper"] for ep in episodes], axis=0).astype(np.float32)
-
-    data.create_dataset("camera0_rgb", data=rgb, compressor=compressor)
-    data.create_dataset("robot0_demo_start_pose", data=demo_start, compressor=compressor)
-    data.create_dataset("robot0_demo_end_pose", data=demo_end, compressor=compressor)
-    data.create_dataset("robot0_eef_pos", data=eef_pos, compressor=compressor)
-    data.create_dataset("robot0_eef_rot_axis_angle", data=eef_rot, compressor=compressor)
-    data.create_dataset("robot0_gripper_width", data=gripper, compressor=compressor)
-
+    # Calculate total sizes first
     episode_lengths = [len(ep["rgb"]) for ep in episodes]
+    total_frames = sum(episode_lengths)
     episode_ends = np.cumsum(episode_lengths)
+    
+    print(f"[SAVE] Total frames: {total_frames}, Average per episode: {total_frames/len(episodes):.1f}")
+    
+    # Get shape from first episode
+    first_ep = episodes[0]
+    rgb_shape = first_ep["rgb"].shape
+    demo_start_shape = first_ep["demo_start"].shape
+    demo_end_shape = first_ep["demo_end"].shape
+    eef_pos_shape = first_ep["eef_pos"].shape
+    eef_rot_shape = first_ep["eef_rot"].shape
+    gripper_shape = first_ep["gripper"].shape
+    
+    # Create datasets with pre-allocated size
+    rgb_ds = data.create_dataset(
+        "camera0_rgb",
+        shape=(total_frames, rgb_shape[1], rgb_shape[2], rgb_shape[3]),
+        dtype=np.uint8,
+        compressor=compressor,
+        chunks=(100, rgb_shape[1], rgb_shape[2], rgb_shape[3])  # Chunk size for better I/O
+    )
+    demo_start_ds = data.create_dataset(
+        "robot0_demo_start_pose",
+        shape=(total_frames, demo_start_shape[1]),
+        dtype=np.float64,
+        compressor=compressor
+    )
+    demo_end_ds = data.create_dataset(
+        "robot0_demo_end_pose",
+        shape=(total_frames, demo_end_shape[1]),
+        dtype=np.float64,
+        compressor=compressor
+    )
+    eef_pos_ds = data.create_dataset(
+        "robot0_eef_pos",
+        shape=(total_frames, eef_pos_shape[1]),
+        dtype=np.float32,
+        compressor=compressor
+    )
+    eef_rot_ds = data.create_dataset(
+        "robot0_eef_rot_axis_angle",
+        shape=(total_frames, eef_rot_shape[1]),
+        dtype=np.float32,
+        compressor=compressor
+    )
+    gripper_ds = data.create_dataset(
+        "robot0_gripper_width",
+        shape=(total_frames, gripper_shape[1]),
+        dtype=np.float32,
+        compressor=compressor
+    )
+    
+    # Write episodes in batches to avoid memory issues
+    current_idx = 0
+    for i, ep in enumerate(episodes):
+        # Use RGB length as the reference, but verify all data lengths match
+        ep_len_rgb = len(ep["rgb"])
+        ep_len_eef = len(ep["eef_pos"])
+        ep_len_gripper = len(ep["gripper"])
+        ep_len_demo_start = len(ep["demo_start"])
+        ep_len_demo_end = len(ep["demo_end"])
+        
+        # Check for length mismatches
+        if ep_len_rgb != ep_len_eef or ep_len_rgb != ep_len_gripper or ep_len_rgb != ep_len_demo_start or ep_len_rgb != ep_len_demo_end:
+            print(f"[SAVE] WARNING: Episode {i} length mismatch - RGB: {ep_len_rgb}, EEF: {ep_len_eef}, Gripper: {ep_len_gripper}, DemoStart: {ep_len_demo_start}, DemoEnd: {ep_len_demo_end}")
+            # Use minimum length to avoid errors
+            ep_len = min(ep_len_rgb, ep_len_eef, ep_len_gripper, ep_len_demo_start, ep_len_demo_end)
+            print(f"[SAVE] Using minimum length: {ep_len} (truncating longer arrays)")
+        else:
+            ep_len = ep_len_rgb
+        
+        end_idx = current_idx + ep_len
+        
+        print(f"[SAVE] Writing episode {i+1}/{len(episodes)} (frames {current_idx} to {end_idx-1})")
+        
+        # Write data in chunks, truncating to ep_len if needed
+        rgb_ds[current_idx:end_idx] = ep["rgb"][:ep_len].astype(np.uint8)
+        demo_start_ds[current_idx:end_idx] = ep["demo_start"][:ep_len].astype(np.float64)
+        demo_end_ds[current_idx:end_idx] = ep["demo_end"][:ep_len].astype(np.float64)
+        eef_pos_ds[current_idx:end_idx] = ep["eef_pos"][:ep_len].astype(np.float32)
+        eef_rot_ds[current_idx:end_idx] = ep["eef_rot"][:ep_len].astype(np.float32)
+        gripper_ds[current_idx:end_idx] = ep["gripper"][:ep_len].astype(np.float32)
+        
+        current_idx = end_idx
+        
+        # Force flush periodically to free memory
+        if (i + 1) % 10 == 0:
+            store.flush()
+            print(f"[SAVE] Flushed after {i+1} episodes")
+
+    # Save metadata
     meta = root.create_group("meta")
     meta.create_dataset("episode_ends", data=episode_ends)
+    
+    # Final flush and close
+    store.flush()
     store.close()
-    print("[SAVE] replay_dataset.zarr.zip saved at:", output_path)
+    print(f"[SAVE] Successfully saved {len(episodes)} episodes ({total_frames} frames) to {output_path}")
 
 
 def _load_progress(session_dir: str) -> set[int]:
@@ -289,6 +377,62 @@ def _save_progress(session_dir: str, completed: set[int]) -> None:
 def _normalize_object_name(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
+
+def save_episode_video(session_dir: str, episode_idx: int, rgb_list: list, fps: float = 30.0, suffix: str = "") -> Optional[str]:
+    """
+    Save episode RGB frames as MP4 video file for visual inspection.
+    
+    Args:
+        session_dir: Path to session directory
+        episode_idx: Episode index
+        rgb_list: List of RGB frames (numpy arrays with shape (H, W, 3))
+        fps: Frames per second for video (default: 30.0)
+        suffix: Optional suffix to add to filename (e.g., "_front", "_side")
+        
+    Returns:
+        str: Path to saved video file, or None if failed
+    """
+    if not rgb_list or len(rgb_list) == 0:
+        print(f"[Video] No frames to save for episode {episode_idx} (suffix: {suffix})")
+        return None
+    
+    # Create video directory
+    video_dir = os.path.join(session_dir, "simulation_videos")
+    os.makedirs(video_dir, exist_ok=True)
+    
+    # Video file path with suffix
+    if suffix:
+        video_path = os.path.join(video_dir, f"episode_{episode_idx:03d}{suffix}.mp4")
+    else:
+        video_path = os.path.join(video_dir, f"episode_{episode_idx:03d}.mp4")
+    
+    try:
+        # Get frame dimensions from first frame
+        first_frame = rgb_list[0]
+        height, width = first_frame.shape[:2]
+        
+        # Initialize video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+        
+        if not out.isOpened():
+            print(f"[Video] ERROR: Failed to open video writer for {video_path}")
+            return None
+        
+        # Write all frames
+        for frame in rgb_list:
+            # Convert RGB to BGR for OpenCV
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            out.write(frame_bgr)
+        
+        out.release()
+        print(f"[Video] Saved video for episode {episode_idx} (suffix: {suffix}): {video_path} ({len(rgb_list)} frames)")
+        return video_path
+        
+    except Exception as e:
+        print(f"[Video] ERROR: Failed to save video for episode {episode_idx}: {e}")
+        return None
+
 def step_world_and_record(
     world,
     camera,
@@ -301,26 +445,51 @@ def step_world_and_record(
     gripper_list,
     render=True,
     sleep_dt=0.01,
+    cameras=None,
+    rgb_lists=None,
+    target_size=(224, 224),  # Target image size for training (H, W)
     ):
     world.step(render=render)
     time.sleep(sleep_dt)
 
-    # RGB
+    # RGB from main camera (for backward compatibility)
     img = camera.get_rgb()
+    
+    # Only record other data if RGB was successfully captured
+    # This ensures all data lists have the same length
     if img is not None:
+        # Resize image to target size (224x224) for training compatibility
+        # Use INTER_AREA for high-quality downsampling
+        if img.shape[:2] != target_size:
+            img = cv2.resize(img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
+        
         rgb_list.append(img)
 
-    # End-effector pose
-    eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
-    eef_pos_list.append(eef_pose6d[:3])
-    eef_rot_list.append(eef_pose6d[3:])
+        # Capture images from all cameras if provided
+        if cameras is not None and rgb_lists is not None:
+            for cam_name, cam in cameras.items():
+                cam_img = cam.get_rgb()
+                if cam_img is not None:
+                    # Resize to target size if needed
+                    if cam_img.shape[:2] != target_size:
+                        cam_img = cv2.resize(cam_img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
+                    rgb_lists[cam_name].append(cam_img)
 
-    # Gripper
-    joint_pos = panda.get_joint_positions()
-    gripper_width = joint_pos[-2] + joint_pos[-1]
-    gripper_list.append([gripper_width])
+        # End-effector pose - only record if RGB was captured
+        eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
+        eef_pos_list.append(eef_pose6d[:3])
+        eef_rot_list.append(eef_pose6d[3:])
 
-    return eef_pose6d
+        # Gripper - only record if RGB was captured
+        joint_pos = panda.get_joint_positions()
+        gripper_width = joint_pos[-2] + joint_pos[-1]
+        gripper_list.append([gripper_width])
+        
+        return eef_pose6d
+    else:
+        # If RGB failed, still return pose for compatibility, but don't record
+        eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
+        return eef_pose6d
 
 def _set_fixed_objects_for_episode(cfg, object_prims):
     if cfg.get("environment_vars", {}).get("SCENE_CONFIG") != "living_scene":
@@ -435,12 +604,122 @@ def main():
         orientation=np.array(franka_rotation)
     )
     set_camera_view(camera_translation, franka_translation)
+    
+    # Robot-mounted camera (for first-person view)
     camera = Camera(
         prim_path=f"{GOPRO_PRIM_PATH}/Camera",
         name="gopro_camera",
-        resolution=(224,224)
+        resolution=(1280, 720)  # Set high resolution
     )
     camera.initialize()
+    
+    # Create multiple cameras for different viewpoints
+    robot_pos = np.array(franka_translation)
+    original_camera_pos = np.array(camera_translation)
+    
+    # Calculate offset from robot to original camera
+    offset_from_robot = original_camera_pos - robot_pos
+    
+    # Helper function to create camera with horizontal view
+    def create_horizontal_camera(name: str, prim_path: str, position: np.ndarray, target: np.ndarray):
+        """Create a camera that looks at target while maintaining horizontal orientation."""
+        look_dir = target - position
+        look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-6)
+        
+        # Force up vector to be [0, 0, 1] (world Z-axis) for horizontal orientation
+        world_up = np.array([0.0, 0.0, 1.0])
+        
+        # If look_dir is nearly vertical (parallel to world_up), use a different reference
+        if abs(np.dot(look_dir, world_up)) > 0.95:
+            # Vertical view: use Y-axis as reference
+            reference = np.array([0.0, 1.0, 0.0])
+            right = np.cross(reference, look_dir)
+        else:
+            # General case: use world_up to compute right
+            right = np.cross(look_dir, world_up)
+        
+        right = right / (np.linalg.norm(right) + 1e-6)
+        
+        # Recompute up vector to ensure it's perpendicular to both look_dir and right
+        up = np.cross(right, look_dir)
+        up = up / (np.linalg.norm(up) + 1e-6)
+        
+        # Build rotation matrix: camera coordinate system x, y, z axes correspond to right, up, -look_dir
+        rot_matrix = np.column_stack([right, up, -look_dir])
+        rot_quat = R.from_matrix(rot_matrix).as_quat()
+        rot_quat_wxyz = np.array([rot_quat[3], rot_quat[0], rot_quat[1], rot_quat[2]])
+        
+        return world.scene.add(
+            Camera(
+                prim_path=prim_path,
+                name=name,
+                position=position,
+                orientation=rot_quat_wxyz,
+                resolution=(1280, 720)
+            )
+        )
+    
+    # Calculate workspace center (robot's working area in front of it)
+    workspace_center = robot_pos + np.array([0.3, 0.0, 0.5])  # 30cm in front, 50cm height
+    
+    # Camera 1: Front view - closer to robot, pointing at workspace
+    front_offset = np.array([1.5, 0.0, 1.0])  # 1.5m in front, 1m height
+    front_camera_pos = robot_pos + front_offset
+    fixed_camera_front = create_horizontal_camera(
+        "fixed_camera_front",
+        "/World/FixedCameraFront",
+        front_camera_pos,
+        workspace_center
+    )
+    
+    # Camera 2: Back view - from behind the robot
+    back_offset = np.array([-1.5, 0.0, 1.0])  # 1.5m behind, 1m height
+    back_camera_pos = robot_pos + back_offset
+    fixed_camera_back = create_horizontal_camera(
+        "fixed_camera_back",
+        "/World/FixedCameraBack",
+        back_camera_pos,
+        workspace_center
+    )
+    
+    # Camera 3: Side view - from the side
+    side_offset = np.array([0.0, -1.5, 1.0])  # 1.5m to the left, 1m height
+    side_camera_pos = robot_pos + side_offset
+    fixed_camera_side = create_horizontal_camera(
+        "fixed_camera_side",
+        "/World/FixedCameraSide",
+        side_camera_pos,
+        workspace_center
+    )
+    
+    # Camera 4: Top view - from above
+    top_offset = np.array([0.0, 0.0, 2.0])  # 2m directly above
+    top_camera_pos = robot_pos + top_offset
+    top_target = workspace_center  # Point at workspace center
+    fixed_camera_top = create_horizontal_camera(
+        "fixed_camera_top",
+        "/World/FixedCameraTop",
+        top_camera_pos,
+        top_target
+    )
+    
+    # Store all cameras in a dictionary for easy access
+    cameras = {
+        "front": fixed_camera_front,
+        "back": fixed_camera_back,
+        "side": fixed_camera_side,
+        "top": fixed_camera_top,
+        "robot": camera  # Robot-mounted camera
+    }
+    
+    print(f"[Camera] Created {len(cameras)} cameras:")
+    print(f"[Camera]   - Front: {front_camera_pos} -> {workspace_center}")
+    print(f"[Camera]   - Back: {back_camera_pos} -> {workspace_center}")
+    print(f"[Camera]   - Side: {side_camera_pos} -> {workspace_center}")
+    print(f"[Camera]   - Top: {top_camera_pos} -> {top_target}")
+    print(f"[Camera]   - Robot-mounted: {GOPRO_PRIM_PATH}/Camera")
+    print(f"[Camera]   - Workspace center: {workspace_center}")
+    
     world.reset()
     prim_mgr = RigidPrimManager()
 
@@ -625,6 +904,8 @@ def main():
             print("[Init] WARNING: Failed to apply EE initial pose")
         
         rgb_list = []
+        # Store images from all cameras
+        rgb_lists = {name: [] for name in cameras.keys()}
         eef_pos_list = []
         eef_rot_list = []
         gripper_list = []
@@ -648,6 +929,8 @@ def main():
                 eef_rot_list,
                 gripper_list,
                 render=True,
+                cameras=cameras,
+                rgb_lists=rgb_lists,
             )
 
             if episode_start_pose is None:
@@ -686,6 +969,12 @@ def main():
             print("[Main] Task fail")
 
         collected_episodes.append(episode_record)
+
+        # Save videos from all cameras with different suffixes
+        for cam_name, cam_rgb_list in rgb_lists.items():
+            if cam_rgb_list:
+                suffix = f"_{cam_name}"
+                save_episode_video(args.session_dir, episode_idx, cam_rgb_list, fps=30.0, suffix=suffix)
 
         if episode_success:
             completed_episodes.add(episode_idx)
