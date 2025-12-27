@@ -55,13 +55,39 @@ def launch_simulator(task, session_dir, episode, width, height):
         
         click.echo(f"[CLI] Launching Isaac Sim + ROS2: task={task}, resolution={width}x{height}")
         
+        # Convert host path to container path
+        # Docker maps the project root to /workspace/voilab
+        if session_dir:
+            # Get the project root (where docker-compose.yaml is located)
+            # This script is in src/voilab/cli.py, so project root is 2 levels up
+            script_dir = Path(__file__).parent.parent.parent
+            project_root = str(script_dir.resolve())
+            
+            session_dir_abs = os.path.abspath(session_dir) if not os.path.isabs(session_dir) else session_dir
+            
+            # If session_dir is within project root, convert to container path
+            if session_dir_abs.startswith(project_root):
+                relative_path = os.path.relpath(session_dir_abs, project_root)
+                container_session_dir = f"/workspace/voilab/{relative_path}"
+                click.echo(f"[CLI] Converted path: {session_dir} -> {container_session_dir}")
+            # If session_dir is already relative, assume it's relative to project root
+            elif not os.path.isabs(session_dir):
+                container_session_dir = f"/workspace/voilab/{session_dir}"
+                click.echo(f"[CLI] Using relative path: {container_session_dir}")
+            # If it's an absolute path outside project root, try to use it directly (may not work)
+            else:
+                container_session_dir = session_dir
+                click.echo(f"[CLI] Warning: session_dir is outside project root, using as-is: {session_dir}", err=True)
+        else:
+            container_session_dir = session_dir
+        
         # Build image
         click.echo("[CLI] Building Docker image...")
         build_cmd = ["docker", "compose", "build", "isaac-sim"]
         subprocess.run(build_cmd, env=env_vars, check=True)
 
-        container_command = f".venv/bin/python scripts/generate_data.py --task {task} --session_dir {session_dir} --episode {episode}"
-        
+        # container_command = f".venv/bin/python scripts/generate_data.py --task {task} --session_dir {session_dir} --episode {episode}"
+        container_command = f".venv/bin/python scripts/generate_data.py --task {task} --session_dir {container_session_dir}"
         # Run container with host network
         click.echo("[CLI] Starting Docker container with host network...")
         compose_run_cmd = [
