@@ -1,0 +1,15 @@
+name: isaac_sim
+
+env_runner:
+  _target_: diffusion_policy.env_runner.isaac_sim_runner.IsaacSimRunner
+  urdf_path: /workspace/voilab/assets/franka_panda/franka_panda_umi-isaacsim.urdf
+  usd_path: /workspace/voilab/assets/ED305_scene/ED305.usd
+  headless: True
+  n_episodes: 1
+  max_steps_per_episode: 800
+  save_video: True
+  save_observation_data: False
+  n_obs_steps: 2
+  n_action_steps: 1
+  fps: 30
+  crf: 22
