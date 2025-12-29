@@ -1,5 +1,5 @@
 # syntax = docker/dockerfile:1.7
-ARG CUDA_VERSION=12.2.0
+ARG CUDA_VERSION=12.8.1
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS uv-base
 
 # Copy only copy uv & uvx binaries (multi-arch, very small)
@@ -30,20 +30,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
-        git cmake build-essential curl wget gnupg2 lsb-release \
-        software-properties-common locales pkg-config ca-certificates \
-        # Python 3.11 runtime only (no pip, no venv module from pip)
-        python3.11 python3.11-dev python3.11-distutils \
-        # All the other libraries you had before
-        libboost-all-dev libqhull-dev libassimp-dev liboctomap-dev \
-        libconsole-bridge-dev libfcl-dev libeigen3-dev \
-        libx11-dev libxaw7-dev libxrandr-dev libgl1-mesa-dev libglu1-mesa-dev \
-        libglew-dev libgles2-mesa-dev libopengl-dev libfreetype-dev \
-        qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
-        libyaml-cpp-dev libzzip-dev freeglut3-dev libogre-1.9-dev \
-        libpng-dev libjpeg-dev python3-pyqt5.qtwebengine \
-        libbullet-dev libasio-dev libtinyxml2-dev \
-        libcunit1-dev libacl1-dev libfmt-dev \
+    git cmake build-essential curl wget gnupg2 lsb-release \
+    software-properties-common locales pkg-config ca-certificates \
+    # Python 3.11 runtime only (no pip, no venv module from pip)
+    python3.11 python3.11-dev python3.11-distutils \
+    # All the other libraries you had before
+    libboost-all-dev libqhull-dev libassimp-dev liboctomap-dev \
+    libconsole-bridge-dev libfcl-dev libeigen3-dev \
+    libx11-dev libxaw7-dev libxrandr-dev libgl1-mesa-dev libglu1-mesa-dev \
+    libglew-dev libgles2-mesa-dev libopengl-dev libfreetype-dev \
+    qtbase5-dev qtchooser qt5-qmake qtbase5-dev-tools \
+    libyaml-cpp-dev libzzip-dev freeglut3-dev libogre-1.9-dev \
+    libpng-dev libjpeg-dev python3-pyqt5.qtwebengine \
+    libbullet-dev libasio-dev libtinyxml2-dev \
+    libcunit1-dev libacl1-dev libfmt-dev \
     && locale-gen en_US en_US.UTF-8 \
     && update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -75,10 +75,20 @@ COPY packages/diffusion_policy/README.md /workspace/voilab/packages/diffusion_po
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --python ${VIRTUAL_ENV}
 
+# Patch hydra-core for Python 3.11 compatibility
+RUN sed -i 's/override_dirname: OverrideDirname = OverrideDirname()/override_dirname: OverrideDirname = field(default_factory=OverrideDirname)/g' ${VIRTUAL_ENV}/lib/python3.11/site-packages/hydra/conf/__init__.py
+
 RUN --mount=type=cache,target=/root/.cache/uv \
+    export UV_HTTP_TIMEOUT=1200 && export UV_HTTP_RETRIES=20 && \
+    # Install Isaac Sim first (might install old torch)
     uv pip install --python ${VIRTUAL_ENV} \
-        "isaacsim[all,extscache]==5.1.0" \
-        --extra-index-url https://pypi.nvidia.com
+    "isaacsim[all,extscache]==5.1.0" \
+    --extra-index-url https://pypi.nvidia.com && \
+    # Force install PyTorch Nightly for CUDA 12.8 (RTX 5090 support) LAST
+    # Also upgrade numpy to 1.26.4 (fix pandas incompat) but keep <2.0 (fix isaac sim crash)
+    uv pip install --python ${VIRTUAL_ENV} --upgrade \
+    --pre torch torchvision torchaudio "numpy==1.26.4" \
+    --index-url https://download.pytorch.org/whl/nightly/cu128
 
 # Copy the rest of the source code
 COPY . /workspace/voilab

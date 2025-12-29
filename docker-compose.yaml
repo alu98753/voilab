@@ -5,9 +5,17 @@ services:
       dockerfile: Dockerfile
     volumes:
       - .:/workspace/voilab
-      - /workspace/voilab/.venv
+      - /workspace/voilab/.venv # 使用匿名卷以從映像中「取消遮罩」隱藏的虛擬環境內容
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /usr/share/vulkan/icd.d:/usr/share/vulkan/icd.d:ro
+      # 添加 Isaac Sim 緩存掛載，避免每次重新創建緩存
+      - ~/docker/isaac-sim/cache/kit:/isaac-sim/kit/cache:rw
+      - ~/docker/isaac-sim/cache/ov:/root/.cache/ov:rw
+      - ~/docker/isaac-sim/cache/pip:/root/.cache/pip:rw
+      - ~/docker/isaac-sim/cache/glcache:/root/.cache/nvidia/GLCache:rw
+      - ~/docker/isaac-sim/cache/computecache:/root/.nv/ComputeCache:rw
+      - ~/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw
+      - ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw
     stdin_open: true
     tty: true
     environment:
@@ -19,8 +27,8 @@ services:
       - XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}
       - ROS_LOCALHOST_ONLY=0
       - ROS_DOMAIN_ID=0
-      - UV_HTTP_TIMEOUT=600
-      - UV_HTTP_RETRIES=10
+      - UV_HTTP_TIMEOUT=1200
+      - UV_HTTP_RETRIES=20
     ipc: host
     deploy:
       resources:
@@ -28,7 +36,7 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [ gpu ]
     runtime: nvidia
     network_mode: host
 
@@ -57,9 +65,13 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [ gpu ]
     runtime: nvidia
     network_mode: host
     command: >
       bash -c "source /opt/ros/humble/setup.bash &&
                tail -f /dev/null"
+
+# 添加命名卷定義
+volumes:
+  voilab-venv:
