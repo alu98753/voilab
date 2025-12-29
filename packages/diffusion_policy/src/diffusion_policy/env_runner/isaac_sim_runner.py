@@ -6,6 +6,7 @@ import cv2
 import zarr
 from loguru import logger
 from typing import Dict, List, Optional, Any
+import collections
 from scipy.spatial.transform import Rotation as R
 
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
@@ -68,6 +69,8 @@ class IsaacSimRunner(BaseImageRunner):
         self.lula_solver = None
         self.art_kine_solver = None
         self.start_eef_rot_quat = None
+        self.check_success_fn = None
+        self.registry_config = None
 
     def _setup_simulation(self):
         if self.world is not None:
@@ -90,6 +93,52 @@ class IsaacSimRunner(BaseImageRunner):
         # Add robot
         print(f"[Debug] Adding robot from: {self.franka_panda_usd}")
         robot_prim = stage_utils.add_reference_to_stage(usd_path=self.franka_panda_usd, prim_path=self.franka_prim_path)
+        
+        if self.registry_config:
+            # 1. Apply Robot Pose
+            franka_pose = self.registry_config.get("franka_pose", {})
+            trans = franka_pose.get("translation")
+            rot = franka_pose.get("rotation_quat")
+            if trans is not None and rot is not None:
+                print(f"[Debug] Setting Registry Robot Pose: {trans}")
+                robot_xform = SingleXFormPrim(prim_path=self.franka_prim_path)
+                robot_xform.set_local_pose(
+                    translation=np.array(trans) / stage_utils.get_stage_units(),
+                    orientation=np.array(rot)
+                )
+
+            # 2. Load Preload Objects
+            env_vars = self.registry_config.get("environment_vars", {})
+            preload_objects = env_vars.get("PRELOAD_OBJECTS", [])
+            ASSETS_DIR = "/workspace/voilab/assets"
+            self.object_prims = {}
+            
+            for entry in preload_objects:
+                raw_name = entry.get("name")
+                asset_filename = entry.get("assets")
+                prim_path = entry.get("prim_path")
+                
+                if not (raw_name and asset_filename and prim_path):
+                    continue
+
+                full_asset_path = os.path.join(ASSETS_DIR, asset_filename)
+                if not os.path.exists(full_asset_path):
+                    print(f"[IsaacSimRunner] WARNING: Asset not found: {full_asset_path}")
+                    continue
+
+                try:
+                    stage_utils.add_reference_to_stage(
+                        usd_path=full_asset_path,
+                        prim_path=prim_path
+                    )
+                    # Create Prim wrapper
+                    obj_prim = SingleXFormPrim(prim_path=prim_path, name=raw_name)
+                    self.object_prims[raw_name] = obj_prim
+                    print(f"[IsaacSimRunner] Loaded object: {raw_name} at {prim_path}")
+                except Exception as e:
+                    print(f"[IsaacSimRunner] ERROR loading {raw_name}: {e}")
+        
+        # Configure gripper
         
         # Configure gripper
         print("[Debug] Configuring gripper...")
@@ -126,7 +175,7 @@ class IsaacSimRunner(BaseImageRunner):
         # Setup camera
         print("[Debug] Setting up camera...")
         self.camera = Camera(
-            prim_path="/World/Franka/panda/panda_link7/gopro_link/camera",
+            prim_path="/World/Franka/panda/panda_link7/gopro_link/Camera",
             resolution=(224, 224)
         )
         self.camera.initialize()
@@ -135,6 +184,10 @@ class IsaacSimRunner(BaseImageRunner):
         self.world.reset()
         logger.info("[IsaacSimRunner] Setup complete")
         print("[Debug] IsaacSimRunner: Setup complete")
+
+    def set_registry_config(self, config: Dict):
+        self.registry_config = config
+        print("[Debug] IsaacSimRunner: Registry config set.")
 
     def get_obs(self) -> Dict[str, np.ndarray]:
         # RGB
@@ -196,62 +249,158 @@ class IsaacSimRunner(BaseImageRunner):
         
         all_episode_stats = []
         
+        n_obs_steps = 2
+        
         for episode_idx in range(self.n_episodes):
             logger.info(f"[IsaacSimRunner] Starting episode {episode_idx+1}/{self.n_episodes}")
             self.world.reset()
+            # Render once to get valid camera data
+            self.world.step(render=True)
+            
             self.start_eef_rot_quat = None
             policy.reset()
             print(f"[Debug] Episode {episode_idx+1}: World reset done.")
             
-            obs_buffer = {k: [] for k in ['camera0_rgb', 'robot0_eef_pos', 'robot0_eef_rot_axis_angle', 'robot0_eef_rot_axis_angle_wrt_start', 'robot0_gripper_width']}
+            # Reset Objects (Cups) to fixed initial positions if loaded
+            if hasattr(self, 'object_prims') and self.object_prims:
+                # Expected Robot Base: [4.5, 2.7, 0.9]
+                # Table Height: ~0.9
+                
+                # Pink Cup (Left-ish, forward)
+                if 'pink cup' in self.object_prims:
+                    # [4.85, 2.60, 0.92] (Z slightly above table)
+                    pos = np.array([4.85, 2.60, 0.92]) 
+                    self.object_prims['pink cup'].set_world_pose(position=pos)
+                    print(f"[IsaacSimRunner] Reset pink cup to {pos}")
+                
+                # Blue Cup (Right-ish, forward)
+                if 'blue cup' in self.object_prims:
+                     # [4.85, 2.80, 0.92]
+                    pos = np.array([4.85, 2.80, 0.92])
+                    self.object_prims['blue cup'].set_world_pose(position=pos)
+                    print(f"[IsaacSimRunner] Reset blue cup to {pos}")
+
+                # Allow physics to settle
+                for _ in range(10): 
+                    self.world.step(render=False)
             
-            frames = []
+            obs_buffer = collections.deque(maxlen=n_obs_steps)
+            # Warm up
+            for _ in range(n_obs_steps):
+                obs_buffer.append(self.get_obs())
+            
+            video_frames = []
+            is_success = False
             done = False
             step_idx = 0
             
             while not done and step_idx < self.max_steps_per_episode:
-                # Capture current observation
-                obs = self.get_obs()
-                for k, v in obs.items():
-                    obs_buffer[k].append(v)
-                    if len(obs_buffer[k]) > self.n_obs_steps:
-                        obs_buffer[k].pop(0)
+                # Prepare Observation Batch (B, T, D)
+                # Stack
+                # obs_buffer contains dicts. We want dict of (B=1, T, D)
+                current_obs = self.get_obs()
+                obs_buffer.append(current_obs)
+                
+                batch_obs = {}
+                # Assume all keys in buffer are present in all entries
+                keys = obs_buffer[0].keys()
+                for key in keys:
+                    # Stack along Time (creates T, ...)
+                    stacked = np.stack([x[key] for x in obs_buffer])
+                    # Add Batch Dim (1, T, ...)
+                    batch_obs[key] = stacked[None, ...]
+                
+                # Relativize Poses (robot0_eef_pos, robot0_eef_rot_axis_angle) wrt Current (Last) Frame
+                # UMI Expects relative obs
+                
+                # Position: Seq - Current
+                key_pos = 'robot0_eef_pos'
+                if key_pos in batch_obs:
+                     current_pos = batch_obs[key_pos][:, -1:, :] # (1, 1, 3)
+                     batch_obs[key_pos] = batch_obs[key_pos] - current_pos
+                
+                # Rotation: Relative to Current (R_current.inv * R_seq) or similar
+                # Using our transformer (Forward: Quat->6D, Inverse: 6D->Quat)
+                # Current obs eef_rot_axis_angle is 6D.
+                # Compute Relative Rotation Sequence
+                key_rot = 'robot0_eef_rot_axis_angle'
+                if key_rot in batch_obs:
+                    # Convert to Quat/Matrix to compute delta
+                    # (1, T, 6)
+                    B, T, D = batch_obs[key_rot].shape
+                    flat_rot6d = batch_obs[key_rot].reshape(B*T, D)
+                    # 6D -> Quat (wxyz) -> Scipy (xyzw)
+                    rot_quat_wxyz = self.rot_transformer.forward(flat_rot6d)
+                    rot_quat_xyzw = rot_quat_wxyz[:, [1, 2, 3, 0]]
+                    rot_objs = R.from_quat(rot_quat_xyzw)
+                    
+                    # Current Rot (Last in sequence)
+                    # Reshape back to identify last
+                    # Last rot is at index (B*T - 1) if B=1
+                    current_rot_obj = rot_objs[-1] 
+                    
+                    # Relativize: target_rel = current.inv * target (Local) or target * current.inv?
+                    # UMI logic (umi_dataset.py): 
+                    # convert_pose_mat_rep(..., base=current, rep='relative')
+                    # -> t_rel = t_world * base_world.inv()  (if matrix multiplication order T_rel = T_world * T_base^-1 ?) -- No
+                    # Usually T_target_in_base = T_base_world.inv() * T_target_world
+                    # So Rot_rel = Rot_base.inv() * Rot_target
+                    
+                    # Apply to all
+                    rot_rel_objs = current_rot_obj.inv() * rot_objs
+                    rot_rel_quat_xyzw = rot_rel_objs.as_quat()
+                    rot_rel_quat_wxyz = rot_rel_quat_xyzw[:, [3, 0, 1, 2]]
+                    
+                    # Back to 6D
+                    rot_rel_6d = self.rot_transformer.inverse(rot_rel_quat_wxyz)
+                    batch_obs[key_rot] = rot_rel_6d.reshape(B, T, D)
 
-                if len(obs_buffer['camera0_rgb']) < self.n_obs_steps:
-                    print(f"[Debug] Warming up obs buffer {len(obs_buffer['camera0_rgb'])}/{self.n_obs_steps}")
-                    self.world.step(render=not self.headless)
-                    continue
-
-                # Prepare observations for policy
-                # Policy expects [1, n_obs_steps, ...]
-                policy_obs = {}
-                for k, v in obs_buffer.items():
-                    val = torch.from_numpy(np.array(v)).unsqueeze(0).to(device)
-                    if k == 'camera0_rgb':
-                        # Input is already (B, T, C, H, W) = (1, T, 3, 224, 224)
-                        # Normalize to [0,1] float32
-                        val = val.float() / 255.0
-                    policy_obs[k] = val
                 
                 # Predict action
-                print("[Debug] Predicting action...")
+                # print("[Debug] Predicting action...")
                 with torch.no_grad():
-                    action_dict = policy.predict_action(policy_obs)
-                print("[Debug] Action predicted.")
+                    action_dict = policy.predict_action(batch_obs)
+                # print("[Debug] Action predicted.")
                 
                 # Execute action (n_action_steps)
+                # Action is (B=1, Horizon, D) -> (Horizon, D)
                 actions = action_dict['action'][0].cpu().numpy() # [horizon, 10]
                 
+                # Get start pose for relative actions
+                current_ee_pos, current_ee_mat = self.art_kine_solver.compute_end_effector_pose()
+                current_ee_quat_xyzw = R.from_matrix(current_ee_mat[:3, :3]).as_quat()
+                current_ee_rot = R.from_quat(current_ee_quat_xyzw)
+
                 for i in range(min(self.n_action_steps, len(actions))):
                     action = actions[i]
                     # action: [pos(3), rot6d(6), gripper(1)]
-                    target_pos = action[:3]
-                    target_gripper_width = action[9]
+                    
+                    # Relative Position: Add to current
+                    delta_pos = action[:3]
+                    # Debug values
+                    if i == 0:
+                        print(f"[Debug] Current EE: {current_ee_pos}")
+                        print(f"[Debug] Action Delta: {delta_pos}")
+                    
+                    target_pos = current_ee_pos + delta_pos
 
-                    target_rot6d = action[3:9]
-                    target_rot_quat_wxyz = self.rot_transformer.forward(target_rot6d[None, :])[0]
-                    target_rot_quat_xyzw = target_rot_quat_wxyz[[1, 2, 3, 0]]
-                    # Note: Isaac Sim uses [w, x, y, z] for orientation in some places, but ArticulationKinematicsSolver uses [w, x, y, z] too.
+                    # Relative Rotation: Compose with current
+                    delta_rot6d = action[3:9]
+                    delta_rot_quat_wxyz = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
+                    delta_rot_quat_xyzw = delta_rot_quat_wxyz[[1, 2, 3, 0]]
+                    delta_rot = R.from_quat(delta_rot_quat_xyzw)
+                    
+                    # Target = Delta * Current (Global delta, consistent with global position delta)
+                    target_rot = delta_rot * current_ee_rot
+                    target_rot_quat_xyzw = target_rot.as_quat()
+                    
+                    # Target Orientation for IK (wxyz check: ArticulationKinematicsSolver expects wxyz?)
+                    # In Step 251 (original code), it used: target_rot_quat_wxyz
+                    # And: target_orientation=target_rot_quat_wxyz
+                    target_rot_quat_wxyz = target_rot_quat_xyzw[[3, 0, 1, 2]]
+                    
+                    # Gripper
+                    target_gripper_width = action[9]
                     
                     # Compute IK
                     ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
@@ -264,42 +413,55 @@ class IsaacSimRunner(BaseImageRunner):
                         # Set gripper
                         g_pos = target_gripper_width / 2.0
                         self.panda.gripper.set_joint_positions(np.array([g_pos, g_pos]))
+                    else:
+                        print(f"[Debug] IK Failed for step {i}! Target Pos: {target_pos}")
                     
                     
-                    print(f"[Debug] Stepping simulation (Action step {i})...")
-                    self.world.step(render=not self.headless)
+                    # print(f"[Debug] Stepping simulation (Action step {i})...")
+                    self.world.step(render=True)
                     
                     if self.save_video:
                         frame = self.camera.get_rgb()
                         if frame is not None:
-                            frames.append(frame)
+                            video_frames.append(frame)
                     
                     step_idx += 1
                     if step_idx >= self.max_steps_per_episode:
                         break
                 
-                # In a real eval, we would check success here using registry
-                # For now, we just run to max steps or a simple done flag
-                # (You can integrate registry.is_episode_completed(info) here)
-
+                if self.check_success_fn:
+                    try:
+                        # Pass context if needed, currently unused by registry
+                        is_success = self.check_success_fn({})
+                        if is_success:
+                            done = True
+                            print(f"[IsaacSimRunner] Episode {episode_idx+1} Success!")
+                    except Exception as e:
+                        print(f"[IsaacSimRunner] Warning: Success check failed: {e}")
+                        
             # Save video
-            if self.save_video and frames:
+            if self.save_video and video_frames:
                 video_path = os.path.join(self.output_dir, f"eval_ep_{episode_idx}.mp4")
-                height, width, _ = frames[0].shape
+                height, width, _ = video_frames[0].shape
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(video_path, fourcc, 30.0, (width, height))
-                for f in frames:
+                for f in video_frames:
                     out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
                 out.release()
                 logger.info(f"[IsaacSimRunner] Saved video to {video_path}")
 
             all_episode_stats.append({
-                'success': False, # Update with real success check
-                'episode_length': step_idx
+                'episode_idx': episode_idx,
+                'length': step_idx,
+                'success': is_success
             })
 
+        print("[IsaacSimRunner] Evaluation complete.")
+        success_rate = np.mean([s['success'] for s in all_episode_stats])
+        avg_length = np.mean([s['length'] for s in all_episode_stats])
+        
         return {
-            'episode_stats': all_episode_stats, # Required by eval script
-            'success_rate': np.mean([s['success'] for s in all_episode_stats]),
-            'avg_steps': np.mean([s['episode_length'] for s in all_episode_stats])
+            'episode_stats': all_episode_stats,
+            'success_rate': success_rate,
+            'avg_episode_length': avg_length
         }

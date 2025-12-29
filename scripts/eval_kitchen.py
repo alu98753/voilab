@@ -117,7 +117,6 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     此腳本會：
     1. 加載數據集並識別 validation episodes
     2. 加載訓練好的模型 checkpoint
-    2. 加載訓練好的模型 checkpoint
     3. 在 Isaac Sim 環境中運行評估（僅對 validation episodes）
     4. 使用 registry 中的成功判斷邏輯評估每個 episode
     5. 計算並輸出成功率等指標
@@ -324,7 +323,26 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         **runner_kwargs
     )
     
+    
+    # --- SUCCESS CHECK LOGIC INJECTION ---
+    import registry
+    registry_class = registry.get_task_registry(task)
+    if not registry_class.validate_environment():
+        print(f"[Eval] WARNING: Registry validation failed for task {task}")
+    
+    # Inject check function into runner
+    # The runner must handle calling this function
+    env_runner.check_success_fn = registry_class.is_episode_completed
+    
+    # Inject Registry Config for Pose Setup
+    if hasattr(env_runner, 'set_registry_config'):
+        env_runner.set_registry_config(registry_class.get_config())
+        
+    print(f"[Eval] Injected success check function and config from registry for task: {task}")
+    # -------------------------------------
+
     # HACK: Force Isaac Sim initialization before PyTorch grabs CUDA context
+    # Moved AFTER injection so _setup_simulation can use the config
     if hasattr(env_runner, '_setup_simulation'):
         print("[Eval] Forcing early Isaac Sim setup...")
         env_runner._setup_simulation()
