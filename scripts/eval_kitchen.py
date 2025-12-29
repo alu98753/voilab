@@ -21,43 +21,64 @@ python scripts/eval_kitchen.py \
     --checkpoint data/outputs/2025.12.27/02.15.38_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt \
     --output_dir data/eval_output \
     --task kitchen \
-    --dataset_path /path/to/dataset.zarr.zip \
-    --n_episodes 10
+    --dataset_path ./AsiaDragon_1127_100/simulation_dataset.zarr.zip \
+    --n_episodes 1 --headless 
 """
 
 import sys
-sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
-sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
+
+
+import click
+import numpy as np # RESTORED: Isaac Sim might need numpy pre-loaded
+
+# Initialize Isaac Sim early to avoid segfaults
+# CRITICAL: This must happen before any torch imports!
+# Filter sys.argv to prevent SimulationApp from choking on custom flags
+original_argv = sys.argv[:]
+sys.argv = [sys.argv[0]]
+if '--headless' in original_argv:
+    sys.argv.append('--headless')
+
+# Using config from generate_data.py to ensure stability
+simulation_app_config = {
+    "headless": '--headless' in original_argv,
+    "width": 1280,
+    "height": 720,
+    "enable_streaming": False,
+    "extensions": ["isaacsim.robot_motion.motion_generation"] 
+}
+print(f"[Eval] Initializing SimulationApp with config: {simulation_app_config}")
+from isaacsim import SimulationApp
+simulation_app = SimulationApp(simulation_app_config)
+# Run one update to settle the engine
+simulation_app.update()
+print("[Eval] SimulationApp initialized successfully.")
+
+# Restore sys.argv for Click/Argparse
+sys.argv = original_argv
+
 
 import sys
 import os
 import pathlib
-import click
-import torch
-import numpy as np
-import tqdm
+
+# Fix HF Cache issue (Disk full)
+os.environ['HF_HOME'] = '/workspace/voilab/data/.cache/huggingface'
+os.makedirs(os.environ['HF_HOME'], exist_ok=True)
+print(f"[Eval] Set HF_HOME to: {os.environ['HF_HOME']}")
+
 import dill
 import hydra
 from omegaconf import OmegaConf
+import inspect
+import json
 
-# Initialize Isaac Sim early to avoid segfaults
-if '--headless' in sys.argv:
-    print("[Eval] Initializing SimulationApp (headless)...")
-    from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": True})
-elif '--help' not in sys.argv:
-    # Do nothing for help
-    pass
-else:
-    print("[Eval] Initializing SimulationApp (windowed)...")
-    from isaacsim import SimulationApp
-    simulation_app = SimulationApp({"headless": False})
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
 # 添加 scripts 目錄到路徑
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import registry
+# import registry # MOVED INSIDE MAIN
 
 # 添加 packages 目錄到路徑
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,6 +86,16 @@ sys.path.insert(0, os.path.join(project_root, 'packages', 'diffusion_policy', 's
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
+
+import sys
+# Force load from source to ensure edits to packages are reflected
+sys.path.insert(0, "/workspace/voilab/packages/diffusion_policy/src")
+sys.path.insert(0, "/workspace/voilab/packages/umi/src")
+
+import diffusion_policy
+
+# import diffusion_policy # MOVED INSIDE MAIN
+print("[Eval] All imports completed (delayed diffusion_policy load).", flush=True)
 
 @click.command()
 @click.option('-c', '--checkpoint', required=True, help='Path to checkpoint file')
@@ -86,12 +117,24 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     此腳本會：
     1. 加載數據集並識別 validation episodes
     2. 加載訓練好的模型 checkpoint
+    2. 加載訓練好的模型 checkpoint
     3. 在 Isaac Sim 環境中運行評估（僅對 validation episodes）
     4. 使用 registry 中的成功判斷邏輯評估每個 episode
     5. 計算並輸出成功率等指標
     """
+    import diffusion_policy
+    from diffusion_policy.workspace.base_workspace import BaseWorkspace
+    import torch
+    import numpy as np
+    import tqdm
+    # Prevent OpenMP conflict between Torch and Isaac Sim
+    torch.set_num_threads(1)
+    
+    print(f"[Eval] Loaded diffusion_policy from: {diffusion_policy.__file__}")
+
     if os.path.exists(output_dir):
-        click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
+        # click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
+        pass
     pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     print(f"[Eval] ========== Evaluation Configuration ==========")
@@ -110,6 +153,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     print(f"\n[Eval] Loading checkpoint from: {checkpoint}")
     payload = torch.load(open(checkpoint, 'rb'), pickle_module=dill)
     cfg = payload['cfg']
+    cfg_payload = cfg # Explicit alias for policy instantiation safety
     
     # Override dataset path if provided
     if dataset_path:
@@ -127,9 +171,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     # Load dataset to get validation episodes
     print(f"\n[Eval] Loading dataset to identify validation episodes...")
     from diffusion_policy.dataset.umi_dataset import UmiDataset
-    print(f"[Debug] Instantiating dataset...")
     train_dataset = hydra.utils.instantiate(cfg.task.dataset)
-    print(f"[Debug] Dataset instantiated.")
     val_dataset = train_dataset.get_validation_dataset()
     
     # Get validation episode indices from train_dataset (val_mask is True for validation episodes)
@@ -139,7 +181,6 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         n_val_episodes = len(val_episode_indices)
         total_episodes = len(val_mask)
         print(f"[Eval] Found {n_val_episodes} validation episodes out of {total_episodes} total episodes")
-        print(f"[Eval] Validation episode indices: {val_episode_indices[:10]}{'...' if len(val_episode_indices) > 10 else ''}")
         
         # Override n_episodes to match validation episodes count
         if n_episodes is None or n_episodes > n_val_episodes:
@@ -152,6 +193,38 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         print(f"[Eval] WARNING: Could not get validation mask from dataset. Using all episodes.")
         val_episode_indices = None
     
+    
+    # Initialize policy directly using Payload Config (Proven to work)
+    print(f"[Debug] Instantiating policy directly from payload config: {cfg_payload.policy._target_}", flush=True)
+    try:
+        model = hydra.utils.instantiate(cfg_payload.policy)
+    except Exception as e:
+        print(f"[Fatal] Failed to instantiate policy from payload: {e}", flush=True)
+        # Fallback to hydration config if payload fails (unlikely)
+        print(f"[Debug] Fallback to hydra config...", flush=True)
+        model = hydra.utils.instantiate(cfg.policy)
+    
+    print(f"[Debug] Loading policy weights...", flush=True)
+    if 'model' in payload['state_dicts']:
+        model.load_state_dict(payload['state_dicts']['model'])
+        print("[Eval] Loaded model weights from checkpoint.", flush=True)
+    else:
+        raise ValueError("Checkpoint payload missing 'model' state dict!")
+
+    workspace = None # No workspace object
+    policy = model
+    if cfg.training.use_ema and 'ema_model' in payload['state_dicts']:
+        print("[Eval] Loading EMA model for evaluation...", flush=True)
+        import copy
+        ema_model = copy.deepcopy(model)
+        ema_model.load_state_dict(payload['state_dicts']['ema_model'])
+        policy = ema_model
+    
+    # Mock workspace for compatibility if needed, but we used policy from workspace later
+    # We need to ensure we don't try to access workspace.model later
+    
+    print(f"[Debug] cfg.task.env_runner target after workspace init: {cfg.task.env_runner['_target_']}", flush=True)
+
     # Override env_runner to use IsaacSimRunner for evaluation
     # The training config might use RealPushTImageRunner, but we need IsaacSimRunner for eval
     if not hasattr(cfg.task, 'env_runner') or \
@@ -159,7 +232,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         print(f"[Eval] Overriding env_runner to use IsaacSimRunner")
         # Try to use isaac_sim task config if available
         try:
-            from hydra import compose, initialize
+            from hydra import compose, initialize_config_dir
             # Fix config_path to be relative to project root
             if not os.path.isabs(config_path):
                 # If relative, make it absolute based on project root
@@ -169,11 +242,15 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
                 config_path_abs = config_path
             
             if os.path.exists(config_path_abs):
-                with initialize(config_path=config_path_abs, version_base=None):
+                print(f"[Debug] Loading config from: {config_path_abs}", flush=True)
+                with initialize_config_dir(config_dir=config_path_abs, version_base=None):
                     isaac_sim_cfg = compose(config_name="task/isaac_sim")
-                    if hasattr(isaac_sim_cfg, 'env_runner'):
-                        cfg.task.env_runner = isaac_sim_cfg.env_runner
+                    print(f"[Debug] isaac_sim_cfg content: {isaac_sim_cfg}", flush=True)
+                    if hasattr(isaac_sim_cfg, 'task') and hasattr(isaac_sim_cfg.task, 'env_runner'):
+                        print(f"[Debug] isaac_sim_cfg.task.env_runner target: {isaac_sim_cfg.task.env_runner['_target_']}", flush=True)
+                        cfg.task.env_runner = isaac_sim_cfg.task.env_runner
                         print(f"[Eval] Loaded env_runner from isaac_sim config")
+                        print(f"[Debug] cfg.task.env_runner target after override: {cfg.task.env_runner['_target_']}", flush=True)
             else:
                 raise FileNotFoundError(f"Config path not found: {config_path_abs}")
         except Exception as e:
@@ -183,7 +260,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
             cfg.task.env_runner = OmegaConf.create({
                 '_target_': 'diffusion_policy.env_runner.isaac_sim_runner.IsaacSimRunner',
                 'urdf_path': '/workspace/voilab/assets/franka_panda/franka_panda_umi-isaacsim.urdf',
-                'usd_path': None,
+                'usd_path': '/workspace/voilab/assets/ED305_scene/ED305.usd',
                 'headless': headless,
                 'n_episodes': n_episodes,
                 'max_steps_per_episode': 200,
@@ -195,31 +272,9 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
                 'crf': 22
             })
     
-    # Initialize workspace
-    print(f"[Debug] Loading workspace class: {cfg._target_}")
-    instance = hydra.utils.get_class(cfg._target_)
-    print(f"[Debug] Workspace class loaded. Initializing instance...")
-    workspace: BaseWorkspace = instance(cfg, output_dir=output_dir)
-    print(f"[Debug] Workspace initialized. Loading payload...")
-    workspace.load_payload(payload, exclude_keys=None, include_keys=None)
-    print(f"[Debug] Payload loaded.")
-    
-    # Get policy from workspace
-    policy = workspace.model
-    if cfg.training.use_ema:
-        policy = workspace.ema_model
-        print(f"[Eval] Using EMA model")
-    else:
-        print(f"[Eval] Using regular model")
-    
-    device = torch.device(device)
-    policy.to(device)
-    policy.eval()
-    
-    print(f"[Eval] Policy loaded and set to eval mode")
-    print(f"[Eval] Policy device: {device}")
-    
+
     # Get task registry for success criteria
+    import registry # Init registry here
     print(f"\n[Eval] Loading task registry for: {task}")
     registry_class = registry.get_task_registry(task)
     is_episode_completed = registry_class.is_episode_completed
@@ -264,12 +319,29 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     
     # Instantiate env runner
     print(f"\n[Eval] Creating environment runner: {env_runner_cfg['_target_']}")
-    print(f"[Debug] Calling hydra.utils.instantiate for env_runner...")
     env_runner = hydra.utils.instantiate(
         env_runner_cfg,
         **runner_kwargs
     )
-    print(f"[Debug] Env runner instantiated.")
+    
+    # HACK: Force Isaac Sim initialization before PyTorch grabs CUDA context
+    if hasattr(env_runner, '_setup_simulation'):
+        print("[Eval] Forcing early Isaac Sim setup...")
+        env_runner._setup_simulation()
+
+    # Policy is already loaded above
+    
+    device = torch.device(device)
+    print(f"[Debug] Moving policy to device: {device}", flush=True)
+    policy.to(device)
+    print(f"[Debug] Policy moved to device.", flush=True)
+    policy.eval()
+    print(f"[Debug] Policy set to eval mode.", flush=True)
+    
+    print(f"[Eval] Policy loaded and set to eval mode")
+    print(f"[Eval] Policy device: {device}")
+    
+
     
     # Run evaluation
     print(f"\n[Eval] ========== Starting Evaluation ==========")
@@ -325,6 +397,9 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     out_path = os.path.join(output_dir, 'eval_log.json')
     json.dump(json_log, open(out_path, 'w'), indent=2, sort_keys=True, default=str)
     print(f"\n[Eval] Results saved to: {out_path}")
+    import subprocess
+    print(f"[Debug] Listing {output_dir} content:")
+    subprocess.run(["ls", "-l", output_dir])
     print(f"[Eval] ==========================================")
     
     return json_log

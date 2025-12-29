@@ -260,6 +260,8 @@ class TimmObsEncoder(ModuleAttrMixin):
         for key in self.rgb_keys:
             img = obs_dict[key]
             B, T = img.shape[:2]
+            if img.shape[2:] != self.key_shape_map[key]:
+                print(f"[Debug] RGB Shape Mismatch for {key}: Got {img.shape[2:]}, Expected {self.key_shape_map[key]}", flush=True)
             assert B == batch_size
             assert img.shape[2:] == self.key_shape_map[key]
             img = img.reshape(B*T, *img.shape[2:])
@@ -273,6 +275,8 @@ class TimmObsEncoder(ModuleAttrMixin):
         for key in self.low_dim_keys:
             data = obs_dict[key]
             B, T = data.shape[:2]
+            if data.shape[2:] != self.key_shape_map[key]:
+                print(f"[Debug] LowDim Shape Mismatch for {key}: Got {data.shape[2:]}, Expected {self.key_shape_map[key]}", flush=True)
             assert B == batch_size
             assert data.shape[2:] == self.key_shape_map[key]
             features.append(data.reshape(B, -1))
