@@ -412,11 +412,12 @@ class IsaacSimRunner(BaseImageRunner):
                             # 3D Axis-Angle -> Matrix -> 6D
                             flat_3d = obs_3d.reshape(B*T, 3)
                             rot_objs = R.from_rotvec(flat_3d)
-                            rot_quat_wxyz = rot_objs.as_quat()[:, [3, 0, 1, 2]] # xyzw -> wxyz
-                            # wxyz -> 6D
+                            # RotationTransformer.inverse expects (x, y, z, w) because it uses scipy backend
+                            rot_quat_xyzw = rot_objs.as_quat()
+                            # wxyz -> 6D (NOTE: Variable name was misleading in original code, inverse takes xyzw)
                             # self.rot_transformer is initialized as from_rep='rotation_6d', to_rep='quaternion'
-                            # So forward() does 6D -> Quat. inverse() does Quat -> 6D.
-                            flat_6d = self.rot_transformer.inverse(rot_quat_wxyz)
+                            # So inverse() does Quat -> 6D.
+                            flat_6d = self.rot_transformer.inverse(rot_quat_xyzw)
                             batch_obs[key] = flat_6d.reshape(B, T, 6)
                 # -------------------------------------------------------------
 
@@ -447,8 +448,8 @@ class IsaacSimRunner(BaseImageRunner):
 
                     # Relative Rotation: Compose with current
                     delta_rot6d = action[3:9]
-                    delta_rot_quat_wxyz = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
-                    delta_rot_quat_xyzw = delta_rot_quat_wxyz[[1, 2, 3, 0]]
+                    # RotationTransformer.forward returns (x, y, z, w) because it uses scipy backend
+                    delta_rot_quat_xyzw = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
                     delta_rot = R.from_quat(delta_rot_quat_xyzw)
                     
                     # Target = Current * Delta (Apply delta in local frame)
