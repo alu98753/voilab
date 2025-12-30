@@ -93,6 +93,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         accelerator = Accelerator(log_with='wandb')
         wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
         wandb_cfg.pop('project')
+        
+        if 'task' in cfg:
+            dataset_path = cfg.task.get('dataset_path', None)
+            if dataset_path:
+                dataset_path = pathlib.Path(dataset_path)
+                if dataset_path.name.endswith('.zarr.zip'):
+                    dataset_name = dataset_path.parent.name
+                else:
+                    dataset_name = dataset_path.name
+                
+                if 'name' in wandb_cfg:
+                    wandb_cfg['name'] = f"{wandb_cfg['name']}_{dataset_name}"
         accelerator.init_trackers(
             project_name=cfg.logging.project,
             config=OmegaConf.to_container(cfg, resolve=True),
