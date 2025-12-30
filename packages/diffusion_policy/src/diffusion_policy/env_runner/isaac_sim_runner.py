@@ -304,19 +304,26 @@ class IsaacSimRunner(BaseImageRunner):
                 # Expected Robot Base: [4.5, 2.7, 0.9]
                 # Table Height: ~0.9
                 
+                # Seed for reproducibility per episode
+                rng = np.random.default_rng(episode_idx)
+                
                 # Pink Cup (Left-ish, forward)
                 if 'pink cup' in self.object_prims:
-                    # [4.85, 2.60, 0.95] (Raised Z to 0.95 to prevent table clipping)
-                    pos = np.array([4.85, 2.60, 0.95]) 
-                    self.object_prims['pink cup'].set_world_pose(position=pos)
-                    print(f"[IsaacSimRunner] Reset pink cup to {pos}")
+                    # Base: [4.85, 2.60, 1.0] + Jitter
+                    jitter = rng.uniform(-0.05, 0.05, size=2)
+                    pos = np.array([4.85 + jitter[0], 2.60 + jitter[1], 1.0]) 
+                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                    self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
+                    print(f"[IsaacSimRunner] Reset pink cup to {pos} (Randomized)")
                 
                 # Blue Cup (Right-ish, forward)
                 if 'blue cup' in self.object_prims:
-                     # [4.85, 2.80, 0.95] (Raised Z to 0.95)
-                    pos = np.array([4.85, 2.80, 0.95])
-                    self.object_prims['blue cup'].set_world_pose(position=pos)
-                    print(f"[IsaacSimRunner] Reset blue cup to {pos}")
+                     # Base: [4.85, 2.80, 1.0] + Jitter
+                    jitter = rng.uniform(-0.05, 0.05, size=2)
+                    pos = np.array([4.85 + jitter[0], 2.80 + jitter[1], 1.0])
+                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                    self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
+                    print(f"[IsaacSimRunner] Reset blue cup to {pos} (Randomized)")
 
                 # Allow physics to settle
                 for _ in range(10): 
@@ -351,11 +358,25 @@ class IsaacSimRunner(BaseImageRunner):
                 # Relativize Poses (robot0_eef_pos, robot0_eef_rot_axis_angle) wrt Current (Last) Frame
                 # UMI Expects relative obs
                 
-                # Position: Seq - Current
+                # Position: Seq - Current (and rotate into current frame)
                 key_pos = 'robot0_eef_pos'
                 if key_pos in batch_obs:
-                     current_pos = batch_obs[key_pos][:, -1:, :] # (1, 1, 3)
-                     batch_obs[key_pos] = batch_obs[key_pos] - current_pos
+                     # (1, T, 3)
+                     pos_seq = batch_obs[key_pos]
+                     current_pos = pos_seq[:, -1:, :] # (1, 1, 3)
+                     
+                     # Get current rotation to relativize position
+                     # We need the last frame's rotation
+                     key_rot_raw = 'robot0_eef_rot_axis_angle'
+                     if key_rot_raw in batch_obs:
+                         # Current obs is axis-angle (3D)
+                         last_axis_angle = batch_obs[key_rot_raw][0, -1, :]
+                         current_rot_obj = R.from_rotvec(last_axis_angle)
+                         # Transform: pos_rel = current_rot.inv * (pos_world - pos_current)
+                         diff = pos_seq - current_pos # (1, T, 3)
+                         B, T, D = diff.shape
+                         # Apply inverse rotation to all points in sequence
+                         batch_obs[key_pos] = current_rot_obj.inv().apply(diff.reshape(-1, 3)).reshape(B, T, D)
                 
                 # Rotation: Relative to Current (R_current.inv * R_seq)
                 # Current obs eef_rot_axis_angle is 3D (Axis-Angle).
@@ -419,14 +440,10 @@ class IsaacSimRunner(BaseImageRunner):
                     action = actions[i]
                     # action: [pos(3), rot6d(6), gripper(1)]
                     
-                    # Relative Position: Add to current
+                    # Relative Position: Rotate by current and add
                     delta_pos = action[:3]
-                    # Debug values
-                    if i == 0:
-                        print(f"[Debug] Current EE: {current_ee_pos}")
-                        print(f"[Debug] Action Delta: {delta_pos}")
-                    
-                    target_pos = current_ee_pos + delta_pos
+                    # Target = Current_Pos + Current_Rot * Delta_Pos (Apply delta in current local frame)
+                    target_pos = current_ee_pos + current_ee_rot.apply(delta_pos)
 
                     # Relative Rotation: Compose with current
                     delta_rot6d = action[3:9]
@@ -434,8 +451,8 @@ class IsaacSimRunner(BaseImageRunner):
                     delta_rot_quat_xyzw = delta_rot_quat_wxyz[[1, 2, 3, 0]]
                     delta_rot = R.from_quat(delta_rot_quat_xyzw)
                     
-                    # Target = Delta * Current (Global delta, consistent with global position delta)
-                    target_rot = delta_rot * current_ee_rot
+                    # Target = Current * Delta (Apply delta in local frame)
+                    target_rot = current_ee_rot * delta_rot
                     target_rot_quat_xyzw = target_rot.as_quat()
                     
                     # Target Orientation for IK (wxyz check: ArticulationKinematicsSolver expects wxyz?)
