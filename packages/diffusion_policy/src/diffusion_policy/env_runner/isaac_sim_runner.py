@@ -13,6 +13,7 @@ from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+import cv2 # Added for resizing to match training data
 
 # Isaac Sim imports
 import omni.usd
@@ -72,7 +73,12 @@ class IsaacSimRunner(BaseImageRunner):
         self.art_kine_solver = None
         self.start_eef_rot_quat = None
         self.check_success_fn = None
+        self.check_success_fn = None
         self.registry_config = None
+        
+        # Magic Grasp State
+        self.attached_object = None
+        self.T_ee_to_obj = None
 
     def _setup_simulation(self):
         if self.world is not None:
@@ -187,7 +193,7 @@ class IsaacSimRunner(BaseImageRunner):
         print("[Debug] Setting up camera...")
         self.camera = Camera(
             prim_path="/World/Franka/panda/panda_link7/gopro_link/Camera",
-            resolution=(224, 224)
+            resolution=(1280, 720) # Match generate_data.py (16:9)
         )
         self.camera.initialize()
 
@@ -200,6 +206,75 @@ class IsaacSimRunner(BaseImageRunner):
         self.registry_config = config
         print("[Debug] IsaacSimRunner: Registry config set.")
 
+    def _update_magic_grasp(self, action_gripper_width: float):
+        """
+        Implements 'Magic Grasp' (Teleport Attachment) to match Training Data generation.
+        """
+        # Thresholds
+        ATTACH_THRESHOLD = 0.04  # < 4cm = Trying to Close
+        DETACH_THRESHOLD = 0.05  # > 5cm = Trying to Open
+        DIST_THRESHOLD = 0.15    # < 15cm = Close enough to grasp
+        
+        # Get Current EE Pose (FK)
+        # Note: art_kine_solver state is updated in get_obs() or before this call?
+        # get_obs updates lula base pose. We should ensure it's up to date.
+        base_pos, base_quat = self.panda.get_world_pose()
+        self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
+        # We also need joint positions? 
+        # art_kine_solver uses 'robot_articulation' which is linked to self.panda (Sim).
+        # So it pulls joint positions from Sim.
+        ee_pos, ee_rot_matrix = self.art_kine_solver.compute_end_effector_pose()
+        
+        T_ee = np.eye(4)
+        T_ee[:3, :3] = ee_rot_matrix
+        T_ee[:3, 3] = ee_pos
+
+        if self.attached_object:
+            # Update Object Pose
+            T_obj = T_ee @ self.T_ee_to_obj
+            pos = T_obj[:3, 3]
+            rot_mat = T_obj[:3, :3]
+            quat_xyzw = R.from_matrix(rot_mat).as_quat()
+            quat_wxyz = quat_xyzw[[3, 0, 1, 2]]
+            
+            self.attached_object.set_world_pose(position=pos, orientation=quat_wxyz)
+            
+            # Detach Condition
+            if action_gripper_width > DETACH_THRESHOLD:
+                print(f"[Magic] Detaching object: {self.attached_object.name}")
+                self.attached_object = None
+                self.T_ee_to_obj = None
+                
+        else:
+            # Attach Condition
+            if action_gripper_width < ATTACH_THRESHOLD:
+                # Find closest object
+                min_dist = float('inf')
+                closest_obj = None
+                
+                if hasattr(self, 'object_prims'):
+                    for name, obj in self.object_prims.items():
+                        # Get object pose
+                        obj_pos, _ = obj.get_world_pose()
+                        dist = np.linalg.norm(obj_pos - ee_pos)
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_obj = obj
+                
+                if closest_obj and min_dist < DIST_THRESHOLD:
+                    # Attach!
+                    print(f"[Magic] Attaching {closest_obj.name} (dist={min_dist:.4f})")
+                    self.attached_object = closest_obj
+                    
+                    # Compute Relative Transform T_ee_to_obj = inv(T_ee) * T_obj
+                    obj_pos, obj_quat_wxyz = closest_obj.get_world_pose()
+                    obj_quat_xyzw = obj_quat_wxyz[[1, 2, 3, 0]]
+                    T_obj = np.eye(4)
+                    T_obj[:3, :3] = R.from_quat(obj_quat_xyzw).as_matrix()
+                    T_obj[:3, 3] = obj_pos
+                    
+                    self.T_ee_to_obj = np.linalg.inv(T_ee) @ T_obj
+
     def get_obs(self) -> Dict[str, np.ndarray]:
         # RGB
         print("[Debug] Getting RGB...")
@@ -209,6 +284,10 @@ class IsaacSimRunner(BaseImageRunner):
             # Fallback for headless or skip frames
             rgb = np.zeros((224, 224, 3), dtype=np.uint8)
         
+        # Resize to 224x224 to match training data (Squashing 16:9 to 1:1)
+        if rgb.shape[:2] != (224, 224):
+             rgb = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
+
         # Transpose to (C, H, W)
         rgb = rgb.transpose(2, 0, 1)
 
@@ -233,7 +312,8 @@ class IsaacSimRunner(BaseImageRunner):
         
         start_rot = R.from_quat(self.start_eef_rot_quat)
         curr_rot = R.from_quat(ee_rot_quat_xyzw)
-        rel_rot = curr_rot * start_rot.inv()
+        # Fix: Correct order is inv(Start) * Curr (Apply Start inverse first to align frames)
+        rel_rot = start_rot.inv() * curr_rot
         rel_rot_axis_angle = rel_rot.as_rotvec().astype(np.float32)
 
         # Gripper width
@@ -261,27 +341,57 @@ class IsaacSimRunner(BaseImageRunner):
             self.world.reset()
             # Render once to get valid camera data
             self.world.step(render=True)
-            
             self.start_eef_rot_quat = None
             policy.reset()
             print(f"[Debug] Episode {episode_idx+1}: World reset done.")
 
-            # --- Initialize Robot Pose (Match generate_data.py) ---
-            # 1. Calibrate Base
+            # --- 1. Reset Objects (Match generate_data.py Phase 1) ---
+            if hasattr(self, 'object_prims') and self.object_prims:
+                # Seed for reproducibility per episode
+                rng = np.random.default_rng(episode_idx)
+                
+                # Disable Randomization for Debugging (Set to 0.0)
+                jitter_scale = 0.0 
+                
+                # Pink Cup
+                if 'pink cup' in self.object_prims:
+                    # Base: [4.85, 2.60, 1.0]
+                    jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
+                    pos = np.array([4.85 + jitter[0], 2.60 + jitter[1], 1.0]) 
+                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                    self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
+                    print(f"[IsaacSimRunner] Reset pink cup to {pos} (Fixed)")
+                
+                # Blue Cup
+                if 'blue cup' in self.object_prims:
+                     # Base: [4.85, 2.80, 1.0]
+                    jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
+                    pos = np.array([4.85 + jitter[0], 2.80 + jitter[1], 1.0])
+                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                    self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
+                    print(f"[IsaacSimRunner] Reset blue cup to {pos} (Fixed)")
+
+            # --- 2. Settle Physics (Match generate_data.py Phase 2) ---
+            print("[Debug] Settling physics for 100 steps...")
+            for _ in range(100):
+                self.world.step(render=False) # Faster without rendering, but need one render at end?
+            self.world.step(render=True)
+
+            # --- 3. Initialize Robot Pose (Match generate_data.py Phase 3) ---
+            # Calibrate Base
             base_pos, base_quat = self.panda.get_world_pose()
             self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
             
-            # 2. Get Current EE Pose
+            # Get Current EE Pose (after settle)
             ee_pos, ee_rot_mat = self.art_kine_solver.compute_end_effector_pose()
             
-            # 3. Calculate Target Init Pose (Kitchen Task Offset)
+            # Calculate Target Init Pose (Kitchen Task Offset)
             # Offset: [-0.16, 0., 0.13]
-            # Quat (WXYZ): [0.0081739, -0.9366365, 0.350194, 0.0030561]
             init_offset = np.array([-0.16, 0., 0.13])
             target_pos = ee_pos + init_offset
             target_quat_wxyz = np.array([0.0081739, -0.9366365, 0.350194, 0.0030561])
             
-            # 4. Apply IK to Init Pose
+            # Apply IK
             print(f"[Debug] Initializing Robot to {target_pos} (Offset: {init_offset})")
             ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
                 target_position=target_pos,
@@ -291,43 +401,16 @@ class IsaacSimRunner(BaseImageRunner):
             if success:
                 self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
                 print("[Debug] Robot initialization IK successful.")
+                # Verify Pose
+                final_ee_pos, final_ee_rot = self.art_kine_solver.compute_end_effector_pose()
+                print(f"[Debug] Achieved EE Position: {final_ee_pos}")
             else:
                 print("[IsaacSimRunner] WARNING: Robot initialization IK failed!")
             
-            # 5. Settle
-            for _ in range(20):
-                self.world.step(render=True) # Render to update camera position
+            # Short Settle after IK
+            for _ in range(10):
+                self.world.step(render=True)
             # --------------------------------------------------------
-            
-            # Reset Objects (Cups) to fixed initial positions if loaded
-            if hasattr(self, 'object_prims') and self.object_prims:
-                # Expected Robot Base: [4.5, 2.7, 0.9]
-                # Table Height: ~0.9
-                
-                # Seed for reproducibility per episode
-                rng = np.random.default_rng(episode_idx)
-                
-                # Pink Cup (Left-ish, forward)
-                if 'pink cup' in self.object_prims:
-                    # Base: [4.85, 2.60, 1.0] + Jitter
-                    jitter = rng.uniform(-0.05, 0.05, size=2)
-                    pos = np.array([4.85 + jitter[0], 2.60 + jitter[1], 1.0]) 
-                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                    self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
-                    print(f"[IsaacSimRunner] Reset pink cup to {pos} (Randomized)")
-                
-                # Blue Cup (Right-ish, forward)
-                if 'blue cup' in self.object_prims:
-                     # Base: [4.85, 2.80, 1.0] + Jitter
-                    jitter = rng.uniform(-0.05, 0.05, size=2)
-                    pos = np.array([4.85 + jitter[0], 2.80 + jitter[1], 1.0])
-                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                    self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
-                    print(f"[IsaacSimRunner] Reset blue cup to {pos} (Randomized)")
-
-                # Allow physics to settle
-                for _ in range(10): 
-                    self.world.step(render=False)
             
             obs_buffer = collections.deque(maxlen=n_obs_steps)
             # Warm up
@@ -479,6 +562,10 @@ class IsaacSimRunner(BaseImageRunner):
                         print(f"[Debug] IK Failed for step {i}! Target Pos: {target_pos}")
                     
                     
+                    
+                    # Apply Magic Grasp
+                    self._update_magic_grasp(target_gripper_width)
+
                     # print(f"[Debug] Stepping simulation (Action step {i})...")
                     self.world.step(render=True)
                     
