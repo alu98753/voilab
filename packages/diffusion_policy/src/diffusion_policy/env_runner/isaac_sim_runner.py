@@ -206,7 +206,7 @@ class IsaacSimRunner(BaseImageRunner):
         self.registry_config = config
         print("[Debug] IsaacSimRunner: Registry config set.")
 
-    def _update_magic_grasp(self, action_gripper_width: float):
+    def _update_magic_grasp(self, action_gripper_width: float, step_idx: int = 0):
         """
         Implements 'Magic Grasp' (Teleport Attachment) to match Training Data generation.
         """
@@ -261,10 +261,17 @@ class IsaacSimRunner(BaseImageRunner):
                             min_dist = dist
                             closest_obj = obj
                 
+                if closest_obj:
+                    # Debug Distance
+                    if step_idx % 10 == 0:
+                        print(f"[Magic Debug] Closest: {closest_obj.name}, Dist: {min_dist:.4f}, Gripper: {action_gripper_width:.4f}")
+
                 if closest_obj and min_dist < DIST_THRESHOLD:
-                    # Attach!
-                    print(f"[Magic] Attaching {closest_obj.name} (dist={min_dist:.4f})")
-                    self.attached_object = closest_obj
+                    # Attach Condition
+                    if action_gripper_width < ATTACH_THRESHOLD:
+                        # Attach!
+                        print(f"[Magic] Attaching {closest_obj.name} (dist={min_dist:.4f})")
+                        self.attached_object = closest_obj
                     
                     # Compute Relative Transform T_ee_to_obj = inv(T_ee) * T_obj
                     obj_pos, obj_quat_wxyz = closest_obj.get_world_pose()
@@ -355,18 +362,18 @@ class IsaacSimRunner(BaseImageRunner):
                 
                 # Pink Cup
                 if 'pink cup' in self.object_prims:
-                    # Base: [4.85, 2.60, 1.0]
+                    # Base: [4.85, 2.60, 1.0] -> Move to [5.00, 2.60] (Closer to Robot X=4.99)
                     jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                    pos = np.array([4.85 + jitter[0], 2.60 + jitter[1], 1.0]) 
+                    pos = np.array([4.70 + jitter[0], 2.60 + jitter[1], 1.0]) 
                     quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
                     self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
                     print(f"[IsaacSimRunner] Reset pink cup to {pos} (Fixed)")
                 
                 # Blue Cup
                 if 'blue cup' in self.object_prims:
-                     # Base: [4.85, 2.80, 1.0]
+                     # Base: [4.85, 2.80, 1.0] -> Move to [5.00, 2.80]
                     jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                    pos = np.array([4.85 + jitter[0], 2.80 + jitter[1], 1.0])
+                    pos = np.array([4.99 + jitter[0], 2.52 + jitter[1], 1.0])
                     quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
                     self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
                     print(f"[IsaacSimRunner] Reset blue cup to {pos} (Fixed)")
@@ -387,12 +394,18 @@ class IsaacSimRunner(BaseImageRunner):
             
             # Calculate Target Init Pose (Kitchen Task Offset)
             # Offset: [-0.16, 0., 0.13]
-            init_offset = np.array([-0.16, 0., 0.13])
-            target_pos = ee_pos + init_offset
+            # init_offset = np.array([-0.16, 0., 0.13])
+            # target_pos = ee_pos + init_offset
+            
+            # FIXED: Hardcode to match Training Data (Episode 0)
+            # Eval: [4.84, 2.64, 1.29] vs Train: [4.99, 2.52, 1.09]
+            # Diff: X+0.15, Y-0.12, Z-0.20
+            target_pos = np.array([4.99, 2.52, 1.09])
+            
             target_quat_wxyz = np.array([0.0081739, -0.9366365, 0.350194, 0.0030561])
             
             # Apply IK
-            print(f"[Debug] Initializing Robot to {target_pos} (Offset: {init_offset})")
+            print(f"[Debug] Initializing Robot to FIXED TARGET {target_pos}")
             ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
                 target_position=target_pos,
                 target_orientation=target_quat_wxyz
@@ -403,7 +416,12 @@ class IsaacSimRunner(BaseImageRunner):
                 print("[Debug] Robot initialization IK successful.")
                 # Verify Pose
                 final_ee_pos, final_ee_rot = self.art_kine_solver.compute_end_effector_pose()
+                final_ee_rot_quat = R.from_matrix(final_ee_rot[:3, :3]).as_quat() # xyzw
+                # Convert to wxyz for display
+                final_ee_rot_wxyz = np.array([final_ee_rot_quat[3], final_ee_rot_quat[0], final_ee_rot_quat[1], final_ee_rot_quat[2]])
                 print(f"[Debug] Achieved EE Position: {final_ee_pos}")
+                print(f"[Debug] Achieved EE Rotation (WXYZ): {final_ee_rot_wxyz}")
+                print(f"[Debug] Target   EE Rotation (WXYZ): {target_quat_wxyz}")
             else:
                 print("[IsaacSimRunner] WARNING: Robot initialization IK failed!")
             
@@ -534,6 +552,15 @@ class IsaacSimRunner(BaseImageRunner):
                     # RotationTransformer.forward returns (x, y, z, w) because it uses scipy backend
                     delta_rot_quat_xyzw = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
                     delta_rot = R.from_quat(delta_rot_quat_xyzw)
+                                        
+                    # DEBUG: Print Action Info
+                    d_pos_mag = np.linalg.norm(delta_pos)
+                    d_rot_mag = delta_rot.magnitude()
+                    d_rot_euler = delta_rot.as_euler('xyz', degrees=True)
+                    gripper_val = action[9]
+                    
+                    if i == 0: # Print first action of the chunk
+                         print(f"[Debug Action] Step {step_idx}: Pos Mag={d_pos_mag:.4f}, Rot Mag={d_rot_mag:.4f}, Euler={d_rot_euler}, Grip={gripper_val:.4f}")
                     
                     # Target = Current * Delta (Apply delta in local frame)
                     target_rot = current_ee_rot * delta_rot
@@ -564,7 +591,7 @@ class IsaacSimRunner(BaseImageRunner):
                     
                     
                     # Apply Magic Grasp
-                    self._update_magic_grasp(target_gripper_width)
+                    self._update_magic_grasp(target_gripper_width, step_idx=step_idx)
 
                     # print(f"[Debug] Stepping simulation (Action step {i})...")
                     self.world.step(render=True)
