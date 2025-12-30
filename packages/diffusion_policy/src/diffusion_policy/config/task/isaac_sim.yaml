@@ -6,7 +6,7 @@ env_runner:
   usd_path: /workspace/voilab/assets/ED305_scene/ED305.usd
   headless: True
   n_episodes: 1
-  max_steps_per_episode: 500
+  max_steps_per_episode: 250
   save_video: True
   save_observation_data: False
   n_obs_steps: 2

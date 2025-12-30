@@ -24,7 +24,7 @@ install-dev: install-uv
 .PHONY launch-jupyterlab:
 launch-jupyterlab: install-dev
 	@echo "Launching Jupyter Lab"
-	@uv run jupyter lab --ip 0.0.0.0 --port 8888 --no-browser
+	@uv run jupyter lab --allow-root --ServerApp.token='0000' --ip 0.0.0.0 --port 8888 --no-browser
 	@echo "Jupyter Lab launched successfully"
 
 .PHONY: install-exiftool

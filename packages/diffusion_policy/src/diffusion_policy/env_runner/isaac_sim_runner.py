@@ -57,6 +57,8 @@ class IsaacSimRunner(BaseImageRunner):
         self.franka_panda_usd = "/workspace/voilab/assets/franka_panda/franka_panda_arm.usd"
         self.franka_prim_path = "/World/Franka"
         self.lula_robot_description_path = "/workspace/voilab/assets/lula/frank_umi_descriptor.yaml"
+        # Use Wrist Camera (GoPro) as expected by UMI Policy
+        self.camera_prim_path = "/World/Franka/panda/panda_link7/gopro_link/Camera"
 
         # Rotation transformers
         self.rot_transformer = RotationTransformer(from_rep='rotation_6d', to_rep='quaternion')
@@ -110,7 +112,7 @@ class IsaacSimRunner(BaseImageRunner):
             # 2. Load Preload Objects
             env_vars = self.registry_config.get("environment_vars", {})
             preload_objects = env_vars.get("PRELOAD_OBJECTS", [])
-            ASSETS_DIR = "/workspace/voilab/assets"
+            ASSETS_DIR = "/workspace/voilab/assets/CADs"
             self.object_prims = {}
             
             for entry in preload_objects:
@@ -133,10 +135,19 @@ class IsaacSimRunner(BaseImageRunner):
                     )
                     # Create Prim wrapper
                     obj_prim = SingleXFormPrim(prim_path=prim_path, name=raw_name)
+                    self.world.scene.add(obj_prim) # Register with scene for physics/reset
                     self.object_prims[raw_name] = obj_prim
                     print(f"[IsaacSimRunner] Loaded object: {raw_name} at {prim_path}")
                 except Exception as e:
                     print(f"[IsaacSimRunner] ERROR loading {raw_name}: {e}")
+        
+                except Exception as e:
+                    print(f"[IsaacSimRunner] ERROR loading {raw_name}: {e}")
+        
+            # 3. Camera Pose: 
+            # REMOVED Fixed Camera Pose application. 
+            # The camera is attached to the robot wrist (GoPro), so it moves with the robot.
+            # We should NOT force it to a fixed world pose.
         
         # Configure gripper
         
@@ -210,13 +221,11 @@ class IsaacSimRunner(BaseImageRunner):
         eef_pos = ee_pos.astype(np.float32)
 
         # EEF rotation (axis-angle)
-        ee_rot_quat_xyzw = R.from_matrix(ee_rot_matrix[:3, :3]).as_quat()
-        ee_rot_quat_wxyz = ee_rot_quat_xyzw[[3, 0, 1, 2]]
+        # Fix: Use as_rotvec() output (3D) instead of 6D rotation to match generate_data.py
+        ee_rot_axis_angle = R.from_matrix(ee_rot_matrix[:3, :3]).as_rotvec().astype(np.float32)
         
-        # Convert to 6D rotation as expected by policy (despite the key name being axis_angle)
-        eef_rot_6d = self.obs_rot_transformer.forward(
-            np.array([ee_rot_quat_wxyz])
-        )[0].astype(np.float32)
+        # We need quaternion for relative rotation calculation
+        ee_rot_quat_xyzw = R.from_matrix(ee_rot_matrix[:3, :3]).as_quat()
 
         # Relative rotation
         if self.start_eef_rot_quat is None:
@@ -225,11 +234,7 @@ class IsaacSimRunner(BaseImageRunner):
         start_rot = R.from_quat(self.start_eef_rot_quat)
         curr_rot = R.from_quat(ee_rot_quat_xyzw)
         rel_rot = curr_rot * start_rot.inv()
-        rel_rot_xyzw = rel_rot.as_quat()
-        rel_rot_wxyz = rel_rot_xyzw[[3, 0, 1, 2]]
-        rel_rot_6d = self.obs_rot_transformer.forward(
-             np.array([rel_rot_wxyz])
-        )[0].astype(np.float32)
+        rel_rot_axis_angle = rel_rot.as_rotvec().astype(np.float32)
 
         # Gripper width
         joint_pos = self.panda.get_joint_positions()
@@ -238,8 +243,8 @@ class IsaacSimRunner(BaseImageRunner):
         return {
             'camera0_rgb': rgb,
             'robot0_eef_pos': eef_pos,
-            'robot0_eef_rot_axis_angle': eef_rot_6d, # Shape (6,)
-            'robot0_eef_rot_axis_angle_wrt_start': rel_rot_6d, # Shape (6,)
+            'robot0_eef_rot_axis_angle': ee_rot_axis_angle, # Shape (3,)
+            'robot0_eef_rot_axis_angle_wrt_start': rel_rot_axis_angle, # Shape (3,)
             'robot0_gripper_width': gripper_width
         }
 
@@ -260,6 +265,39 @@ class IsaacSimRunner(BaseImageRunner):
             self.start_eef_rot_quat = None
             policy.reset()
             print(f"[Debug] Episode {episode_idx+1}: World reset done.")
+
+            # --- Initialize Robot Pose (Match generate_data.py) ---
+            # 1. Calibrate Base
+            base_pos, base_quat = self.panda.get_world_pose()
+            self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
+            
+            # 2. Get Current EE Pose
+            ee_pos, ee_rot_mat = self.art_kine_solver.compute_end_effector_pose()
+            
+            # 3. Calculate Target Init Pose (Kitchen Task Offset)
+            # Offset: [-0.16, 0., 0.13]
+            # Quat (WXYZ): [0.0081739, -0.9366365, 0.350194, 0.0030561]
+            init_offset = np.array([-0.16, 0., 0.13])
+            target_pos = ee_pos + init_offset
+            target_quat_wxyz = np.array([0.0081739, -0.9366365, 0.350194, 0.0030561])
+            
+            # 4. Apply IK to Init Pose
+            print(f"[Debug] Initializing Robot to {target_pos} (Offset: {init_offset})")
+            ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
+                target_position=target_pos,
+                target_orientation=target_quat_wxyz
+            )
+            
+            if success:
+                self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
+                print("[Debug] Robot initialization IK successful.")
+            else:
+                print("[IsaacSimRunner] WARNING: Robot initialization IK failed!")
+            
+            # 5. Settle
+            for _ in range(20):
+                self.world.step(render=True) # Render to update camera position
+            # --------------------------------------------------------
             
             # Reset Objects (Cups) to fixed initial positions if loaded
             if hasattr(self, 'object_prims') and self.object_prims:
@@ -268,15 +306,15 @@ class IsaacSimRunner(BaseImageRunner):
                 
                 # Pink Cup (Left-ish, forward)
                 if 'pink cup' in self.object_prims:
-                    # [4.85, 2.60, 0.92] (Z slightly above table)
-                    pos = np.array([4.85, 2.60, 0.92]) 
+                    # [4.85, 2.60, 0.95] (Raised Z to 0.95 to prevent table clipping)
+                    pos = np.array([4.85, 2.60, 0.95]) 
                     self.object_prims['pink cup'].set_world_pose(position=pos)
                     print(f"[IsaacSimRunner] Reset pink cup to {pos}")
                 
                 # Blue Cup (Right-ish, forward)
                 if 'blue cup' in self.object_prims:
-                     # [4.85, 2.80, 0.92]
-                    pos = np.array([4.85, 2.80, 0.92])
+                     # [4.85, 2.80, 0.95] (Raised Z to 0.95)
+                    pos = np.array([4.85, 2.80, 0.95])
                     self.object_prims['blue cup'].set_world_pose(position=pos)
                     print(f"[IsaacSimRunner] Reset blue cup to {pos}")
 
@@ -319,41 +357,47 @@ class IsaacSimRunner(BaseImageRunner):
                      current_pos = batch_obs[key_pos][:, -1:, :] # (1, 1, 3)
                      batch_obs[key_pos] = batch_obs[key_pos] - current_pos
                 
-                # Rotation: Relative to Current (R_current.inv * R_seq) or similar
-                # Using our transformer (Forward: Quat->6D, Inverse: 6D->Quat)
-                # Current obs eef_rot_axis_angle is 6D.
+                # Rotation: Relative to Current (R_current.inv * R_seq)
+                # Current obs eef_rot_axis_angle is 3D (Axis-Angle).
                 # Compute Relative Rotation Sequence
                 key_rot = 'robot0_eef_rot_axis_angle'
                 if key_rot in batch_obs:
-                    # Convert to Quat/Matrix to compute delta
-                    # (1, T, 6)
+                    # (1, T, 3)
                     B, T, D = batch_obs[key_rot].shape
-                    flat_rot6d = batch_obs[key_rot].reshape(B*T, D)
-                    # 6D -> Quat (wxyz) -> Scipy (xyzw)
-                    rot_quat_wxyz = self.rot_transformer.forward(flat_rot6d)
-                    rot_quat_xyzw = rot_quat_wxyz[:, [1, 2, 3, 0]]
-                    rot_objs = R.from_quat(rot_quat_xyzw)
+                    flat_axis_angle = batch_obs[key_rot].reshape(B*T, D)
+                    
+                    # Axis-Angle -> Rotation Object
+                    rot_objs = R.from_rotvec(flat_axis_angle)
                     
                     # Current Rot (Last in sequence)
-                    # Reshape back to identify last
-                    # Last rot is at index (B*T - 1) if B=1
                     current_rot_obj = rot_objs[-1] 
                     
-                    # Relativize: target_rel = current.inv * target (Local) or target * current.inv?
-                    # UMI logic (umi_dataset.py): 
-                    # convert_pose_mat_rep(..., base=current, rep='relative')
-                    # -> t_rel = t_world * base_world.inv()  (if matrix multiplication order T_rel = T_world * T_base^-1 ?) -- No
-                    # Usually T_target_in_base = T_base_world.inv() * T_target_world
-                    # So Rot_rel = Rot_base.inv() * Rot_target
-                    
-                    # Apply to all
+                    # Relativize: Rot_rel = Rot_base.inv() * Rot_target
                     rot_rel_objs = current_rot_obj.inv() * rot_objs
-                    rot_rel_quat_xyzw = rot_rel_objs.as_quat()
-                    rot_rel_quat_wxyz = rot_rel_quat_xyzw[:, [3, 0, 1, 2]]
                     
-                    # Back to 6D
-                    rot_rel_6d = self.rot_transformer.inverse(rot_rel_quat_wxyz)
-                    batch_obs[key_rot] = rot_rel_6d.reshape(B, T, D)
+                    # Back to Axis Angle (3D)
+                    rot_rel_axis_angle = rot_rel_objs.as_rotvec().astype(np.float32)
+                    batch_obs[key_rot] = rot_rel_axis_angle.reshape(B, T, D)
+
+                # --- Adapter: Convert 3D Axis-Angle to 6D Rotation for Policy ---
+                # Policy expects 6D (Shape 6), but we have 3D (Shape 3).
+                # keys to convert: 'robot0_eef_rot_axis_angle', 'robot0_eef_rot_axis_angle_wrt_start'
+                keys_to_convert = ['robot0_eef_rot_axis_angle', 'robot0_eef_rot_axis_angle_wrt_start']
+                for key in keys_to_convert:
+                    if key in batch_obs:
+                        obs_3d = batch_obs[key] # (B, T, 3)
+                        B, T, D = obs_3d.shape
+                        if D == 3:
+                            # 3D Axis-Angle -> Matrix -> 6D
+                            flat_3d = obs_3d.reshape(B*T, 3)
+                            rot_objs = R.from_rotvec(flat_3d)
+                            rot_quat_wxyz = rot_objs.as_quat()[:, [3, 0, 1, 2]] # xyzw -> wxyz
+                            # wxyz -> 6D
+                            # self.rot_transformer is initialized as from_rep='rotation_6d', to_rep='quaternion'
+                            # So forward() does 6D -> Quat. inverse() does Quat -> 6D.
+                            flat_6d = self.rot_transformer.inverse(rot_quat_wxyz)
+                            batch_obs[key] = flat_6d.reshape(B, T, 6)
+                # -------------------------------------------------------------
 
                 
                 # Predict action
