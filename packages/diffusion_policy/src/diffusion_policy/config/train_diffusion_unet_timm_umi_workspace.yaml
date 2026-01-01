@@ -157,7 +157,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 2000
-  num_epochs: 120
+  num_epochs: 40
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
@@ -177,12 +177,13 @@ training:
 
 logging:
   project: umi
+  entity: alu98753-national-yang-ming-chiao-tung-university
   resume: False
   mode: online
   name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
-  group: null
+  group: ${task_name}
 
 checkpoint:
   topk:

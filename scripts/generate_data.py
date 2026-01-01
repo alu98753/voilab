@@ -34,7 +34,7 @@ args = parser.parse_args()
 from isaacsim import SimulationApp
 
 config = {
-    "headless": False,
+    "headless": True,
     "width": 1280,
     "height": 720,
     "enable_streaming": False,
@@ -352,6 +352,34 @@ def save_multi_episode_dataset(output_path: str, episodes: list[dict]) -> None:
     store.close()
     print(f"[SAVE] Successfully saved {len(episodes)} episodes ({total_frames} frames) to {output_path}")
 
+def save_episode_video(session_dir: str, episode_idx: int, rgb_list: list, fps: float = 30.0, suffix: str = "") -> Optional[str]:
+    """
+    Save episode RGB frames as MP4 video file.
+    """
+    import cv2
+    if not rgb_list:
+        return None
+    
+    video_dir = os.path.join(session_dir, "simulation_videos")
+    os.makedirs(video_dir, exist_ok=True)
+    
+    video_path = os.path.join(video_dir, f"episode_{episode_idx:03d}{suffix}.mp4")
+    
+    try:
+        height, width = rgb_list[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+        
+        for frame in rgb_list:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            out.write(frame_bgr)
+        
+        out.release()
+        return video_path
+    except Exception as e:
+        print(f"[Video] ERROR: Failed to save video: {e}")
+        return None
+
 
 def _load_progress(session_dir: str) -> set[int]:
     progress_path = os.path.join(session_dir, ".previous_progress.json")
@@ -377,62 +405,6 @@ def _save_progress(session_dir: str, completed: set[int]) -> None:
 def _normalize_object_name(name: str) -> str:
     return name.strip().lower().replace(" ", "_")
 
-
-def save_episode_video(session_dir: str, episode_idx: int, rgb_list: list, fps: float = 30.0, suffix: str = "") -> Optional[str]:
-    """
-    Save episode RGB frames as MP4 video file for visual inspection.
-    
-    Args:
-        session_dir: Path to session directory
-        episode_idx: Episode index
-        rgb_list: List of RGB frames (numpy arrays with shape (H, W, 3))
-        fps: Frames per second for video (default: 30.0)
-        suffix: Optional suffix to add to filename (e.g., "_front", "_side")
-        
-    Returns:
-        str: Path to saved video file, or None if failed
-    """
-    if not rgb_list or len(rgb_list) == 0:
-        print(f"[Video] No frames to save for episode {episode_idx} (suffix: {suffix})")
-        return None
-    
-    # Create video directory
-    video_dir = os.path.join(session_dir, "simulation_videos")
-    os.makedirs(video_dir, exist_ok=True)
-    
-    # Video file path with suffix
-    if suffix:
-        video_path = os.path.join(video_dir, f"episode_{episode_idx:03d}{suffix}.mp4")
-    else:
-        video_path = os.path.join(video_dir, f"episode_{episode_idx:03d}.mp4")
-    
-    try:
-        # Get frame dimensions from first frame
-        first_frame = rgb_list[0]
-        height, width = first_frame.shape[:2]
-        
-        # Initialize video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
-        
-        if not out.isOpened():
-            print(f"[Video] ERROR: Failed to open video writer for {video_path}")
-            return None
-        
-        # Write all frames
-        for frame in rgb_list:
-            # Convert RGB to BGR for OpenCV
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            out.write(frame_bgr)
-        
-        out.release()
-        print(f"[Video] Saved video for episode {episode_idx} (suffix: {suffix}): {video_path} ({len(rgb_list)} frames)")
-        return video_path
-        
-    except Exception as e:
-        print(f"[Video] ERROR: Failed to save video for episode {episode_idx}: {e}")
-        return None
-
 def step_world_and_record(
     world,
     camera,
@@ -447,49 +419,33 @@ def step_world_and_record(
     sleep_dt=0.01,
     cameras=None,
     rgb_lists=None,
-    target_size=(224, 224),  # Target image size for training (H, W)
     ):
     world.step(render=render)
     time.sleep(sleep_dt)
 
-    # RGB from main camera (for backward compatibility)
+    # RGB
     img = camera.get_rgb()
-    
-    # Only record other data if RGB was successfully captured
-    # This ensures all data lists have the same length
     if img is not None:
-        # Resize image to target size (224x224) for training compatibility
-        # Use INTER_AREA for high-quality downsampling
-        if img.shape[:2] != target_size:
-            img = cv2.resize(img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
-        
         rgb_list.append(img)
-
-        # Capture images from all cameras if provided
+        
+        # Capture from other cameras if provided
         if cameras is not None and rgb_lists is not None:
             for cam_name, cam in cameras.items():
                 cam_img = cam.get_rgb()
                 if cam_img is not None:
-                    # Resize to target size if needed
-                    if cam_img.shape[:2] != target_size:
-                        cam_img = cv2.resize(cam_img, (target_size[1], target_size[0]), interpolation=cv2.INTER_AREA)
                     rgb_lists[cam_name].append(cam_img)
 
-        # End-effector pose - only record if RGB was captured
-        eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
-        eef_pos_list.append(eef_pose6d[:3])
-        eef_rot_list.append(eef_pose6d[3:])
+    # End-effector pose
+    eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
+    eef_pos_list.append(eef_pose6d[:3])
+    eef_rot_list.append(eef_pose6d[3:])
 
-        # Gripper - only record if RGB was captured
-        joint_pos = panda.get_joint_positions()
-        gripper_width = joint_pos[-2] + joint_pos[-1]
-        gripper_list.append([gripper_width])
-        
-        return eef_pose6d
-    else:
-        # If RGB failed, still return pose for compatibility, but don't record
-        eef_pose6d = get_end_effector_pose(panda, lula_solver, art_kine_solver)
-        return eef_pose6d
+    # Gripper
+    joint_pos = panda.get_joint_positions()
+    gripper_width = joint_pos[-2] + joint_pos[-1]
+    gripper_list.append([gripper_width])
+
+    return eef_pose6d
 
 def _set_fixed_objects_for_episode(cfg, object_prims):
     if cfg.get("environment_vars", {}).get("SCENE_CONFIG") != "living_scene":
@@ -543,6 +499,36 @@ def plan_line_cartesian(
 
     return [np.concatenate([p, q_wxyz]) for p, q_wxyz in zip(positions, quats_wxyz)]
 
+def create_horizontal_camera(world, name: str, prim_path: str, position: np.ndarray, target: np.ndarray, resolution=(224, 224)):
+    """Create a camera that looks at target while maintaining horizontal orientation."""
+    look_dir = target - position
+    look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-6)
+    
+    world_up = np.array([0.0, 0.0, 1.0])
+    
+    if abs(np.dot(look_dir, world_up)) > 0.95:
+        reference = np.array([0.0, 1.0, 0.0])
+        right = np.cross(reference, look_dir)
+    else:
+        right = np.cross(look_dir, world_up)
+    
+    right = right / (np.linalg.norm(right) + 1e-6)
+    up = np.cross(right, look_dir)
+    up = up / (np.linalg.norm(up) + 1e-6)
+    
+    rot_matrix = np.column_stack([right, up, -look_dir])
+    rot_quat = R.from_matrix(rot_matrix).as_quat()
+    rot_quat_wxyz = np.array([rot_quat[3], rot_quat[0], rot_quat[1], rot_quat[2]])
+    
+    return world.scene.add(
+        cam := Camera(
+            prim_path=prim_path,
+            name=name,
+            position=position,
+            orientation=rot_quat_wxyz,
+            resolution=resolution
+        )
+    )
 
 def main():
     """Main entry point."""
@@ -605,121 +591,37 @@ def main():
     )
     set_camera_view(camera_translation, franka_translation)
     
-    # Robot-mounted camera (for first-person view)
+    # Main GoPro Camera
     camera = Camera(
         prim_path=f"{GOPRO_PRIM_PATH}/Camera",
         name="gopro_camera",
-        resolution=(1280, 720)  # Set high resolution
+        resolution=(224,224)
     )
     camera.initialize()
-    
-    # Create multiple cameras for different viewpoints
+
+    # Additional Monitoring Cameras (Front/Back)
     robot_pos = np.array(franka_translation)
-    original_camera_pos = np.array(camera_translation)
+    workspace_center = robot_pos + np.array([0.3, 0.0, 0.5])
     
-    # Calculate offset from robot to original camera
-    offset_from_robot = original_camera_pos - robot_pos
-    
-    # Helper function to create camera with horizontal view
-    def create_horizontal_camera(name: str, prim_path: str, position: np.ndarray, target: np.ndarray):
-        """Create a camera that looks at target while maintaining horizontal orientation."""
-        look_dir = target - position
-        look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-6)
-        
-        # Force up vector to be [0, 0, 1] (world Z-axis) for horizontal orientation
-        world_up = np.array([0.0, 0.0, 1.0])
-        
-        # If look_dir is nearly vertical (parallel to world_up), use a different reference
-        if abs(np.dot(look_dir, world_up)) > 0.95:
-            # Vertical view: use Y-axis as reference
-            reference = np.array([0.0, 1.0, 0.0])
-            right = np.cross(reference, look_dir)
-        else:
-            # General case: use world_up to compute right
-            right = np.cross(look_dir, world_up)
-        
-        right = right / (np.linalg.norm(right) + 1e-6)
-        
-        # Recompute up vector to ensure it's perpendicular to both look_dir and right
-        up = np.cross(right, look_dir)
-        up = up / (np.linalg.norm(up) + 1e-6)
-        
-        # Build rotation matrix: camera coordinate system x, y, z axes correspond to right, up, -look_dir
-        rot_matrix = np.column_stack([right, up, -look_dir])
-        rot_quat = R.from_matrix(rot_matrix).as_quat()
-        rot_quat_wxyz = np.array([rot_quat[3], rot_quat[0], rot_quat[1], rot_quat[2]])
-        
-        return world.scene.add(
-            Camera(
-                prim_path=prim_path,
-                name=name,
-                position=position,
-                orientation=rot_quat_wxyz,
-                resolution=(1280, 720)
-            )
-        )
-    
-    # Calculate workspace center (robot's working area in front of it)
-    workspace_center = robot_pos + np.array([0.3, 0.0, 0.5])  # 30cm in front, 50cm height
-    
-    # Camera 1: Front view - closer to robot, pointing at workspace
-    front_offset = np.array([1.5, 0.0, 1.0])  # 1.5m in front, 1m height
-    front_camera_pos = robot_pos + front_offset
+    front_camera_pos = robot_pos + np.array([1.5, 0.0, 1.0])
     fixed_camera_front = create_horizontal_camera(
-        "fixed_camera_front",
-        "/World/FixedCameraFront",
-        front_camera_pos,
-        workspace_center
+        world, "fixed_camera_front", "/World/FixedCameraFront", front_camera_pos, workspace_center,
+        resolution=(1280, 720) # High resolution for monitoring only
     )
+    fixed_camera_front.initialize()
     
-    # Camera 2: Back view - from behind the robot
-    back_offset = np.array([-1.5, 0.0, 1.0])  # 1.5m behind, 1m height
-    back_camera_pos = robot_pos + back_offset
+    back_camera_pos = robot_pos + np.array([-1.5, 0.0, 1.0])
     fixed_camera_back = create_horizontal_camera(
-        "fixed_camera_back",
-        "/World/FixedCameraBack",
-        back_camera_pos,
-        workspace_center
+        world, "fixed_camera_back", "/World/FixedCameraBack", back_camera_pos, workspace_center,
+        resolution=(1280, 720) # High resolution for monitoring only
     )
+    fixed_camera_back.initialize()
     
-    # Camera 3: Side view - from the side
-    side_offset = np.array([0.0, -1.5, 1.0])  # 1.5m to the left, 1m height
-    side_camera_pos = robot_pos + side_offset
-    fixed_camera_side = create_horizontal_camera(
-        "fixed_camera_side",
-        "/World/FixedCameraSide",
-        side_camera_pos,
-        workspace_center
-    )
-    
-    # Camera 4: Top view - from above
-    top_offset = np.array([0.0, 0.0, 2.0])  # 2m directly above
-    top_camera_pos = robot_pos + top_offset
-    top_target = workspace_center  # Point at workspace center
-    fixed_camera_top = create_horizontal_camera(
-        "fixed_camera_top",
-        "/World/FixedCameraTop",
-        top_camera_pos,
-        top_target
-    )
-    
-    # Store all cameras in a dictionary for easy access
     cameras = {
         "front": fixed_camera_front,
-        "back": fixed_camera_back,
-        "side": fixed_camera_side,
-        "top": fixed_camera_top,
-        "robot": camera  # Robot-mounted camera
+        "back": fixed_camera_back
     }
-    
-    print(f"[Camera] Created {len(cameras)} cameras:")
-    print(f"[Camera]   - Front: {front_camera_pos} -> {workspace_center}")
-    print(f"[Camera]   - Back: {back_camera_pos} -> {workspace_center}")
-    print(f"[Camera]   - Side: {side_camera_pos} -> {workspace_center}")
-    print(f"[Camera]   - Top: {top_camera_pos} -> {top_target}")
-    print(f"[Camera]   - Robot-mounted: {GOPRO_PRIM_PATH}/Camera")
-    print(f"[Camera]   - Workspace center: {workspace_center}")
-    
+
     world.reset()
     prim_mgr = RigidPrimManager()
 
@@ -904,8 +806,9 @@ def main():
             print("[Init] WARNING: Failed to apply EE initial pose")
         
         rgb_list = []
-        # Store images from all cameras
-        rgb_lists = {name: [] for name in cameras.keys()}
+        # Support for multi-camera recording
+        rgb_lists = {cam_name: [] for cam_name in cameras.keys()}
+        
         eef_pos_list = []
         eef_rot_list = []
         gripper_list = []
@@ -930,7 +833,7 @@ def main():
                 gripper_list,
                 render=True,
                 cameras=cameras,
-                rgb_lists=rgb_lists,
+                rgb_lists=rgb_lists
             )
 
             if episode_start_pose is None:
@@ -970,12 +873,11 @@ def main():
 
         collected_episodes.append(episode_record)
 
-        # Save videos from all cameras with different suffixes
+        # Save videos for visualization and inspection
+        save_episode_video(args.session_dir, episode_idx, rgb_list, suffix="_robot")
         for cam_name, cam_rgb_list in rgb_lists.items():
-            if cam_rgb_list:
-                suffix = f"_{cam_name}"
-                save_episode_video(args.session_dir, episode_idx, cam_rgb_list, fps=30.0, suffix=suffix)
-
+            save_episode_video(args.session_dir, episode_idx, cam_rgb_list, suffix=f"_{cam_name}")
+    
         if episode_success:
             completed_episodes.add(episode_idx)
             _save_progress(args.session_dir, completed_episodes)

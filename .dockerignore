@@ -9,13 +9,20 @@ Dockerfile
 *.conf
 *.yml
 
-# 排除訓練輸出和檢查點（這些文件很大且不需要在 Docker 鏡像中）
-data/outputs/*
-data/outputs/**/*
+# 排除所有 data 目錄中的內容（避免構建時複製大量數據）
+data/
+data/*
 
-# 排除其他大型數據文件
+# 排除大型數據集目錄和 zip 文件
+AsiaDragon_*/
+*.zip
 *.zarr.zip
 *.zarr
+wandb/
+# 確保 .git 不被複製 (通常很大)
+.git/
+.gitignore
+.gitmodules
 *.mp4
 *.MP4
 *.pkl
