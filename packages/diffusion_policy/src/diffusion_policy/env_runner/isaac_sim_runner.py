@@ -13,7 +13,6 @@ from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
-import cv2
 
 # Isaac Sim imports
 import omni.usd
@@ -203,6 +202,31 @@ class IsaacSimRunner(BaseImageRunner):
         h_ap = self.camera.get_horizontal_aperture()
         v_ap = self.camera.get_vertical_aperture()
         print(f"[IsaacSimRunner] Camera Configured: Resolution={res}, HorizAperture={h_ap:.4f}, VertAperture={v_ap:.4f}")
+        
+        # Setup Front Monitoring Camera (Match generate_data.py)
+        print("[Debug] Setting up front monitoring camera...")
+        stage_units = stage_utils.get_stage_units()
+        # Default franka_translation from registry or hardcoded
+        franka_pose = self.registry_config.get("franka_pose", {}) if self.registry_config else {}
+        franka_trans = franka_pose.get("translation", [4.5, 2.7, 0.9])
+        robot_pos = np.array(franka_trans) / stage_units
+        front_camera_pos = robot_pos + (np.array([6.5, 0.0, 1.75]) / stage_units)
+        
+        # Hardcoded Euler Angles to avoid Matrix Roll issues
+        euler_angles = [180, 165, 0] # [x, y, z]
+        rot = R.from_euler('xyz', euler_angles, degrees=True)
+        rot_quat_xyzw = rot.as_quat()
+        rot_quat_wxyz = np.array([rot_quat_xyzw[3], rot_quat_xyzw[0], rot_quat_xyzw[1], rot_quat_xyzw[2]])
+        
+        self.fixed_camera_front = Camera(
+            prim_path="/World/FixedCameraFront",
+            name="fixed_camera_front",
+            position=front_camera_pos,
+            orientation=rot_quat_wxyz,
+            resolution=(1280, 720)
+        )
+        self.fixed_camera_front.initialize()
+        print(f"[IsaacSimRunner] Front Camera Configured at {front_camera_pos}")
 
         print("[Debug] Resetting world...")
         self.world.reset()
@@ -500,6 +524,7 @@ class IsaacSimRunner(BaseImageRunner):
                 obs_buffer.append(self.get_obs())
             
             video_frames = []
+            video_frames_front = []
             is_success = False
             done = False
             step_idx = 0
@@ -664,6 +689,11 @@ class IsaacSimRunner(BaseImageRunner):
                         frame = self.camera.get_rgb()
                         if frame is not None:
                             video_frames.append(frame)
+                        
+                        # Record front camera
+                        frame_front = self.fixed_camera_front.get_rgb()
+                        if frame_front is not None:
+                            video_frames_front.append(frame_front)
                     
                     step_idx += 1
                     if step_idx >= self.max_steps_per_episode:
@@ -689,6 +719,17 @@ class IsaacSimRunner(BaseImageRunner):
                     out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
                 out.release()
                 logger.info(f"[IsaacSimRunner] Saved video to {video_path}")
+                
+                # Save front video
+                if video_frames_front:
+                    video_path_front = os.path.join(self.output_dir, f"eval_ep_{episode_idx}_front.mp4")
+                    height, width, _ = video_frames_front[0].shape
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out_front = cv2.VideoWriter(video_path_front, fourcc, 30.0, (width, height))
+                    for f in video_frames_front:
+                        out_front.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+                    out_front.release()
+                    logger.info(f"[IsaacSimRunner] Saved front video to {video_path_front}")
 
             all_episode_stats.append({
                 'episode_idx': episode_idx,

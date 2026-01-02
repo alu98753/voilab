@@ -107,15 +107,32 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     4. 使用 registry 中的成功判斷邏輯評估每個 episode
     5. 計算並輸出成功率等指標
     """
-    import diffusion_policy
-    from diffusion_policy.workspace.base_workspace import BaseWorkspace
     import torch
-    import numpy as np
     import tqdm
     # Prevent OpenMP conflict between Torch and Isaac Sim
     torch.set_num_threads(1)
     
     print(f"[Eval] Loaded diffusion_policy from: {diffusion_policy.__file__}")
+
+    # Refine output_dir based on checkpoint path
+    # Example checkpoint: data/outputs/2025.12.31/08.01.31_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt
+    # We want to extract: 2025.12.31/08.01.31_train_diffusion_unet_timm_umi/latest
+    try:
+        ckpt_path = pathlib.Path(checkpoint).resolve()
+        parts = ckpt_path.parts
+        # Search for 'outputs' in the path to find the date and run name
+        if 'outputs' in parts:
+            outputs_idx = parts.index('outputs')
+            if len(parts) > outputs_idx + 2:
+                date_str = parts[outputs_idx + 1]
+                run_str = parts[outputs_idx + 2]
+                ckpt_name = ckpt_path.stem # 'latest'
+                
+                # Construct refined path: root / date / run / ckpt_name
+                output_dir = os.path.join(output_dir, date_str, run_str, ckpt_name)
+                print(f"[Eval] Refined output directory: {output_dir}")
+    except Exception as e:
+        print(f"[Eval] WARNING: Could not refine output directory path: {e}")
 
     if os.path.exists(output_dir):
         # click.confirm(f"Output path {output_dir} already exists! Overwrite?", abort=True)
@@ -178,12 +195,43 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         print(f"[Eval] WARNING: Could not get validation mask from dataset. Using all episodes.")
         val_episode_indices = None
     
-    # Calculate object_poses.json path
+    # Calculate object_poses.json path and map original indices
     object_poses_path = None
     if not random_poses and dataset_path:
         # Expected: dataset_path is ./AsiaDragon_1127_100/simulation_dataset.zarr.zip
         # JSON: ./AsiaDragon_1127_100/demos/mapping/object_poses.json
         dataset_dir = os.path.dirname(dataset_path)
+        
+        # 1. Look for .previous_progress.json to map sequential zarr indices to original raw indices
+        progress_path = os.path.join(dataset_dir, '.previous_progress.json')
+        completed_episodes = None
+        if os.path.exists(progress_path):
+            try:
+                with open(progress_path, 'r') as f:
+                    progress_data = json.load(f)
+                    completed_episodes = progress_data.get('completed_episodes', [])
+                    print(f"[Eval] Loaded mapping from {progress_path}, {len(completed_episodes)} episodes found.")
+            except Exception as e:
+                print(f"[Eval] WARNING: Failed to load {progress_path}: {e}")
+        
+        # 2. Map val_episode_indices to original indices
+        if completed_episodes is not None and val_episode_indices is not None:
+            # val_episode_indices are sequential indices into the Zarr's 'successful' subset.
+            # completed_episodes[idx] gives the original raw index for that Zarr entry.
+            mapped_indices = []
+            for idx in val_episode_indices:
+                if idx < len(completed_episodes):
+                    mapped_indices.append(completed_episodes[idx])
+                else:
+                    print(f"[Eval] WARNING: Index {idx} out of range for completed_episodes (len={len(completed_episodes)})")
+                    mapped_indices.append(idx) # Fallback to sequential
+            
+            print(f"[Eval] Mapping Zarr indices to original raw indices:")
+            print(f"       Zarr: {val_episode_indices[:10]}...")
+            print(f"       Raw:  {mapped_indices[:10]}...")
+            val_episode_indices = mapped_indices
+
+        # 3. Locate object_poses.json
         potential_path = os.path.join(dataset_dir, 'demos', 'mapping', 'object_poses.json')
         if os.path.exists(potential_path):
             object_poses_path = potential_path
