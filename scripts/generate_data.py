@@ -499,7 +499,7 @@ def plan_line_cartesian(
 
     return [np.concatenate([p, q_wxyz]) for p, q_wxyz in zip(positions, quats_wxyz)]
 
-def create_horizontal_camera(world, name: str, prim_path: str, position: np.ndarray, target: np.ndarray, resolution=(224, 224)):
+def create_horizontal_camera(world, name: str, prim_path: str, position: np.ndarray, target: np.ndarray, resolution=(224, 224), aperture=None):
     """Create a camera that looks at target while maintaining horizontal orientation."""
     look_dir = target - position
     look_dir = look_dir / (np.linalg.norm(look_dir) + 1e-6)
@@ -520,15 +520,22 @@ def create_horizontal_camera(world, name: str, prim_path: str, position: np.ndar
     rot_quat = R.from_matrix(rot_matrix).as_quat()
     rot_quat_wxyz = np.array([rot_quat[3], rot_quat[0], rot_quat[1], rot_quat[2]])
     
-    return world.scene.add(
-        cam := Camera(
-            prim_path=prim_path,
-            name=name,
-            position=position,
-            orientation=rot_quat_wxyz,
-            resolution=resolution
-        )
+    cam = Camera(
+        prim_path=prim_path,
+        name=name,
+        position=position,
+        orientation=rot_quat_wxyz,
+        resolution=resolution
     )
+    world.scene.add(cam)
+    
+    if aperture is not None:
+        cam.set_horizontal_aperture(aperture)
+        # Ensure aspect ratio is preserved in senseor dimensions
+        cam.set_vertical_aperture(aperture * (resolution[1] / resolution[0]))
+        cam.set_focal_length(35.0) # Wide angle
+        
+    return cam
 
 def main():
     """Main entry point."""
@@ -600,29 +607,48 @@ def main():
     camera.initialize()
 
     # Additional Monitoring Cameras (Front/Back)
-    robot_pos = np.array(franka_translation)
-    workspace_center = robot_pos + np.array([0.3, 0.0, 0.5])
+    stage_units = stage_utils.get_stage_units()
+    robot_pos = np.array(franka_translation) / stage_units
+    print(f"[Main] Robot Position: {robot_pos}")
+    # Target the robot body ("waist" level)
+    workspace_center = robot_pos + (np.array([1.5, 0.0, 1.5]) / stage_units)
     
-    front_camera_pos = robot_pos + np.array([1.5, 0.0, 1.0])
-    fixed_camera_front = create_horizontal_camera(
-        world, "fixed_camera_front", "/World/FixedCameraFront", front_camera_pos, workspace_center,
-        resolution=(1280, 720) # High resolution for monitoring only
+    # Front Camera: Close-Range Debug Mode
+    # Using Hardcoded Euler Angles to avoid Matrix Roll issues
+    front_camera_pos = robot_pos + (np.array([1.2, 0.0, 1.5]) / stage_units)
+    
+    # Rotation Logic:
+    # Standard Camera looks to -Z.
+    # We want to look roughly to -X (Robot direction) and slightly down.
+    # Rotation around Y-axis by ~115 degrees should achieve this.
+    euler_angles = [0, 115, 0] # [x, y, z]
+    rot = R.from_euler('y', euler_angles[1], degrees=True)
+    rot_quat_xyzw = rot.as_quat()
+    rot_quat_wxyz = np.array([rot_quat_xyzw[3], rot_quat_xyzw[0], rot_quat_xyzw[1], rot_quat_xyzw[2]])
+    
+    print(f"[DEBUG] Using Hardcoded Euler Y=115")
+    print(f"  Quat (wxyz): {rot_quat_wxyz}")
+
+    fixed_camera_front = Camera(
+        prim_path="/World/FixedCameraFront",
+        name="fixed_camera_front",
+        position=front_camera_pos,
+        orientation=rot_quat_wxyz,
+        resolution=(1280, 720)
     )
     fixed_camera_front.initialize()
-    
-    back_camera_pos = robot_pos + np.array([-1.5, 0.0, 1.0])
-    fixed_camera_back = create_horizontal_camera(
-        world, "fixed_camera_back", "/World/FixedCameraBack", back_camera_pos, workspace_center,
-        resolution=(1280, 720) # High resolution for monitoring only
-    )
-    fixed_camera_back.initialize()
+    print(f"[Main] Monitoring Cameras Configured: Units={stage_units}, FrontPos={front_camera_pos}")
     
     cameras = {
-        "front": fixed_camera_front,
-        "back": fixed_camera_back
+        "front": fixed_camera_front
     }
 
     world.reset()
+
+    # [DEBUG] Check where the robot ACTUALLY is
+    actual_pos, actual_quat = panda.get_world_pose()
+    print(f"[DEBUG] Actual Robot Pose after Reset: Pos={actual_pos}, Quat={actual_quat}")
+    print(f"[DEBUG] Config Robot Pos: {robot_pos * stage_units}")
     prim_mgr = RigidPrimManager()
 
     lula_solver = None
