@@ -606,29 +606,18 @@ def main():
     )
     camera.initialize()
 
-    # Additional Monitoring Cameras (Front/Back)
+    # Additional Monitoring Cameras
     stage_units = stage_utils.get_stage_units()
     robot_pos = np.array(franka_translation) / stage_units
-    print(f"[Main] Robot Position: {robot_pos}")
-    # Target the robot body ("waist" level)
-    workspace_center = robot_pos + (np.array([1.5, 0.0, 1.5]) / stage_units)
+
+    # Front Camera: 
+    front_camera_pos = robot_pos + (np.array([6.5, 0.0, 1.75]) / stage_units)
     
-    # Front Camera: Close-Range Debug Mode
     # Using Hardcoded Euler Angles to avoid Matrix Roll issues
-    front_camera_pos = robot_pos + (np.array([1.2, 0.0, 1.5]) / stage_units)
-    
-    # Rotation Logic:
-    # Standard Camera looks to -Z.
-    # We want to look roughly to -X (Robot direction) and slightly down.
-    # Rotation around Y-axis by ~115 degrees should achieve this.
-    euler_angles = [0, 115, 0] # [x, y, z]
-    rot = R.from_euler('y', euler_angles[1], degrees=True)
+    euler_angles = [180, 165, 0] # [x, y, z]
+    rot = R.from_euler('xyz', euler_angles, degrees=True)
     rot_quat_xyzw = rot.as_quat()
     rot_quat_wxyz = np.array([rot_quat_xyzw[3], rot_quat_xyzw[0], rot_quat_xyzw[1], rot_quat_xyzw[2]])
-    
-    print(f"[DEBUG] Using Hardcoded Euler Y=115")
-    print(f"  Quat (wxyz): {rot_quat_wxyz}")
-
     fixed_camera_front = Camera(
         prim_path="/World/FixedCameraFront",
         name="fixed_camera_front",
@@ -637,6 +626,10 @@ def main():
         resolution=(1280, 720)
     )
     fixed_camera_front.initialize()
+
+    print(f"[Main] Robot Position: {robot_pos}")    
+    print(f"[DEBUG] Using Hardcoded Euler Y={euler_angles[1]}")
+    print(f"  Quat (wxyz): {rot_quat_wxyz}")
     print(f"[Main] Monitoring Cameras Configured: Units={stage_units}, FrontPos={front_camera_pos}")
     
     cameras = {
