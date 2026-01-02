@@ -10,7 +10,7 @@
 
 用法:
 uv run voilab eval-model \
-    --checkpoint data/outputs/2025.12.27/02.15.38_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt \
+    --checkpoint data/outputs/2025.12.31/08.01.31_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt \
     --output_dir data/eval_output \
     --task kitchen \
     --dataset_path ./AsiaDragon_1127_100/simulation_dataset.zarr.zip \
@@ -18,7 +18,7 @@ uv run voilab eval-model \
 
 或者直接使用:
 python scripts/eval_kitchen.py \
-    --checkpoint data/outputs/2025.12.27/02.15.38_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt \
+    --checkpoint data/outputs/2025.12.31/08.01.31_train_diffusion_unet_timm_umi/checkpoints/latest.ckpt \
     --output_dir data/eval_output \
     --task kitchen \
     --dataset_path ./AsiaDragon_1127_100/simulation_dataset.zarr.zip \
@@ -26,10 +26,10 @@ python scripts/eval_kitchen.py \
 """
 
 import sys
-
-
 import click
 import numpy as np # RESTORED: Isaac Sim might need numpy pre-loaded
+import os
+import pathlib
 
 # Initialize Isaac Sim early to avoid segfaults
 # CRITICAL: This must happen before any torch imports!
@@ -58,9 +58,7 @@ print("[Eval] SimulationApp initialized successfully.")
 sys.argv = original_argv
 
 
-import sys
-import os
-import pathlib
+
 
 # Fix HF Cache issue (Disk full)
 os.environ['HF_HOME'] = '/workspace/voilab/data/.cache/huggingface'
@@ -75,19 +73,6 @@ import json
 
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-
-# 添加 scripts 目錄到路徑
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# import registry # MOVED INSIDE MAIN
-
-# 添加 packages 目錄到路徑
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(project_root, 'packages', 'diffusion_policy', 'src'))
-
-from diffusion_policy.workspace.base_workspace import BaseWorkspace
-
-
-import sys
 # Force load from source to ensure edits to packages are reflected
 sys.path.insert(0, "/workspace/voilab/packages/diffusion_policy/src")
 sys.path.insert(0, "/workspace/voilab/packages/umi/src")
@@ -106,11 +91,12 @@ print("[Eval] All imports completed (delayed diffusion_policy load).", flush=Tru
 @click.option('--dataset_path', default=None, help='Path to dataset zarr zip file (optional, for reference)')
 @click.option('--n_episodes', default=10, type=int, help='Number of evaluation episodes')
 @click.option('--headless', is_flag=True, help='Run in headless mode (no GUI)')
+@click.option('--random_poses', is_flag=True, help='Use random poses instead of recorded poses from JSON')
 @click.option('--config-name', default='train_diffusion_unet_timm_umi_workspace', 
               help='Config name to use')
 @click.option('--config-path', default='packages/diffusion_policy/src/diffusion_policy/config',
               help='Path to config directory')
-def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headless, config_name, config_path):
+def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headless, random_poses, config_name, config_path):
     """
     評估訓練好的 Diffusion Policy 模型（僅使用 Validation Episodes）
     
@@ -145,7 +131,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     print(f"[Eval] Headless mode: {headless}")
     if dataset_path:
         print(f"[Eval] Dataset path: {dataset_path}")
-    print(f"[Eval] Evaluation mode: Validation episodes only")
+    print(f"[Eval] Evaluation mode: {'Random Poses' if random_poses else 'Recorded Poses'}")
     print(f"[Eval] ==============================================")
     
     # Load checkpoint
@@ -191,6 +177,20 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     else:
         print(f"[Eval] WARNING: Could not get validation mask from dataset. Using all episodes.")
         val_episode_indices = None
+    
+    # Calculate object_poses.json path
+    object_poses_path = None
+    if not random_poses and dataset_path:
+        # Expected: dataset_path is ./AsiaDragon_1127_100/simulation_dataset.zarr.zip
+        # JSON: ./AsiaDragon_1127_100/demos/mapping/object_poses.json
+        dataset_dir = os.path.dirname(dataset_path)
+        potential_path = os.path.join(dataset_dir, 'demos', 'mapping', 'object_poses.json')
+        if os.path.exists(potential_path):
+            object_poses_path = potential_path
+            print(f"[Eval] Found object poses at: {object_poses_path}")
+        else:
+            print(f"[Eval] WARNING: object_poses.json not found at {potential_path}. Falling back to random mode.")
+            random_poses = True
     
     
     # Initialize policy directly using Payload Config (Proven to work)
@@ -273,9 +273,12 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     
 
     # Get task registry for success criteria
-    import registry # Init registry here
     print(f"\n[Eval] Loading task registry for: {task}")
+    import registry 
     registry_class = registry.get_task_registry(task)
+    if not registry_class.validate_environment():
+        print(f"[Eval] WARNING: Registry validation failed for task {task}")
+    
     is_episode_completed = registry_class.is_episode_completed
     print(f"[Eval] Success criteria loaded from: {registry_class.__name__}")
     
@@ -299,7 +302,13 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     if n_episodes is not None and 'n_episodes' in sig.parameters:
         runner_kwargs['n_episodes'] = n_episodes
     
-    # Pass validation episode indices if runner accepts it
+    # Pass object poses and episode indices configuration
+    if 'use_recorded_poses' in sig.parameters:
+        runner_kwargs['use_recorded_poses'] = not random_poses
+    
+    if object_poses_path and 'object_poses_path' in sig.parameters:
+        runner_kwargs['object_poses_path'] = object_poses_path
+
     if val_episode_indices is not None and 'episode_indices' in sig.parameters:
         # Limit to requested number of episodes
         runner_kwargs['episode_indices'] = val_episode_indices[:n_episodes] if n_episodes else val_episode_indices
@@ -324,15 +333,9 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     )
     
     
-    # --- SUCCESS CHECK LOGIC INJECTION ---
-    import registry
-    registry_class = registry.get_task_registry(task)
-    if not registry_class.validate_environment():
-        print(f"[Eval] WARNING: Registry validation failed for task {task}")
-    
     # Inject check function into runner
     # The runner must handle calling this function
-    env_runner.check_success_fn = registry_class.is_episode_completed
+    env_runner.check_success_fn = is_episode_completed
     
     # Inject Registry Config for Pose Setup
     if hasattr(env_runner, 'set_registry_config'):

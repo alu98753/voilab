@@ -13,7 +13,7 @@ from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.model.common.rotation_transformer import RotationTransformer
-import cv2 # Added for resizing to match training data
+import cv2
 
 # Isaac Sim imports
 import omni.usd
@@ -41,6 +41,9 @@ class IsaacSimRunner(BaseImageRunner):
         headless: bool = True,
         save_video: bool = True,
         save_observation_data: bool = False,
+        use_recorded_poses: bool = True,
+        object_poses_path: Optional[str] = None,
+        episode_indices: Optional[List[int]] = None,
         **kwargs
     ):
         super().__init__(output_dir)
@@ -53,6 +56,9 @@ class IsaacSimRunner(BaseImageRunner):
         self.headless = headless
         self.save_video = save_video
         self.save_observation_data = save_observation_data
+        self.use_recorded_poses = use_recorded_poses
+        self.object_poses_path = object_poses_path
+        self.episode_indices = episode_indices
 
         # Robot config
         self.franka_panda_usd = "/workspace/voilab/assets/franka_panda/franka_panda_arm.usd"
@@ -72,7 +78,6 @@ class IsaacSimRunner(BaseImageRunner):
         self.lula_solver = None
         self.art_kine_solver = None
         self.start_eef_rot_quat = None
-        self.check_success_fn = None
         self.check_success_fn = None
         self.registry_config = None
         
@@ -147,15 +152,10 @@ class IsaacSimRunner(BaseImageRunner):
                 except Exception as e:
                     print(f"[IsaacSimRunner] ERROR loading {raw_name}: {e}")
         
-                except Exception as e:
-                    print(f"[IsaacSimRunner] ERROR loading {raw_name}: {e}")
-        
             # 3. Camera Pose: 
             # REMOVED Fixed Camera Pose application. 
             # The camera is attached to the robot wrist (GoPro), so it moves with the robot.
             # We should NOT force it to a fixed world pose.
-        
-        # Configure gripper
         
         # Configure gripper
         print("[Debug] Configuring gripper...")
@@ -192,10 +192,17 @@ class IsaacSimRunner(BaseImageRunner):
         # Setup camera
         print("[Debug] Setting up camera...")
         self.camera = Camera(
-            prim_path="/World/Franka/panda/panda_link7/gopro_link/Camera",
-            resolution=(1280, 720) # Match generate_data.py (16:9)
+            prim_path=self.camera_prim_path,
+            name="eval_camera",
+            resolution=(224, 224) # Match updated generate_data.py (Square)
         )
         self.camera.initialize()
+        
+        # Verify Resolution and Aperture
+        res = self.camera.get_resolution()
+        h_ap = self.camera.get_horizontal_aperture()
+        v_ap = self.camera.get_vertical_aperture()
+        print(f"[IsaacSimRunner] Camera Configured: Resolution={res}, HorizAperture={h_ap:.4f}, VertAperture={v_ap:.4f}")
 
         print("[Debug] Resetting world...")
         self.world.reset()
@@ -282,6 +289,9 @@ class IsaacSimRunner(BaseImageRunner):
                     
                     self.T_ee_to_obj = np.linalg.inv(T_ee) @ T_obj
 
+    def _normalize_object_name(self, name: str) -> str:
+        return name.strip().lower().replace(" ", "_")
+
     def get_obs(self) -> Dict[str, np.ndarray]:
         # RGB
         print("[Debug] Getting RGB...")
@@ -341,10 +351,15 @@ class IsaacSimRunner(BaseImageRunner):
         
         all_episode_stats = []
         
-        n_obs_steps = 2
         
-        for episode_idx in range(self.n_episodes):
-            logger.info(f"[IsaacSimRunner] Starting episode {episode_idx+1}/{self.n_episodes}")
+        # Determine episodes to run
+        if self.episode_indices is not None:
+            ep_indices = self.episode_indices
+        else:
+            ep_indices = range(self.n_episodes)
+        
+        for i, episode_idx in enumerate(ep_indices):
+            logger.info(f"[IsaacSimRunner] Starting episode {i+1}/{len(ep_indices)} (episode_idx: {episode_idx})")
             self.world.reset()
             # Render once to get valid camera data
             self.world.step(render=True)
@@ -352,37 +367,86 @@ class IsaacSimRunner(BaseImageRunner):
             policy.reset()
             print(f"[Debug] Episode {episode_idx+1}: World reset done.")
 
+
             # --- 1. Reset Objects (Match generate_data.py Phase 1) ---
             if hasattr(self, 'object_prims') and self.object_prims:
-                # Seed for reproducibility per episode
-                rng = np.random.default_rng(episode_idx)
+                # OPTION A: Load recorded poses from JSON (Default)
+                if self.use_recorded_poses and self.object_poses_path and os.path.exists(self.object_poses_path):
+                    try:
+                        from object_loader import load_object_transforms_from_json
+                        object_transforms = load_object_transforms_from_json(
+                            self.object_poses_path,
+                            episode_index=episode_idx,
+                            aruco_tag_pose=self.registry_config.get("aruco_tag_pose") if self.registry_config else None,
+                            cfg=self.registry_config,
+                        )
+                        
+                        if len(object_transforms) > 0:
+                            print(f"[IsaacSimRunner] Loading recorded poses for episode {episode_idx}")
+                            for obj in object_transforms:
+                                obj_name = self._normalize_object_name(obj["object_name"])
+                                if obj_name in self.object_prims:
+                                    obj_pos = np.array(obj["position"], dtype=np.float64)
+                                    # FIX: Only apply position to match generate_data.py behavior (keeps cups upright)
+                                    self.object_prims[obj_name].set_world_pose(position=obj_pos)
+                                    print(f"[IsaacSimRunner] Positioned {obj_name} at {obj_pos} from recorded data (orientation maintained)")
+                                else:
+                                    # Try a more fuzzy match if needed (e.g. "cup" vs "pink_cup")
+                                    matched = False
+                                    for prim_name in self.object_prims.keys():
+                                        if self._normalize_object_name(prim_name) == obj_name or \
+                                           obj_name in self._normalize_object_name(prim_name) or \
+                                           self._normalize_object_name(prim_name) in obj_name:
+                                            obj_pos = np.array(obj["position"], dtype=np.float64)
+                                            # FIX: Only apply position to match generate_data.py behavior (keeps cups upright)
+                                            self.object_prims[prim_name].set_world_pose(position=obj_pos)
+                                            print(f"[IsaacSimRunner] Positioned {prim_name} at {obj_pos} (fuzzy match with {obj_name}, orientation maintained)")
+                                            matched = True
+                                            break
+                                    if not matched:
+                                        print(f"[IsaacSimRunner] WARNING: Object {obj_name} from JSON not found in scene")
+                        else:
+                            print(f"[IsaacSimRunner] WARNING: No transforms found for episode {episode_idx} in JSON")
+                    except Exception as e:
+                        print(f"[IsaacSimRunner] ERROR loading recorded poses: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Fallback to random mode if JSON loading fails? Or just continue?
                 
-                # Disable Randomization for Debugging (Set to 0.0)
-                jitter_scale = 0.0 
-                
-                # Pink Cup
-                if 'pink cup' in self.object_prims:
-                    # Base: [4.85, 2.60, 1.0] -> Move to [5.00, 2.60] (Closer to Robot X=4.99)
-                    jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                    pos = np.array([4.70 + jitter[0], 2.60 + jitter[1], 1.0]) 
-                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                    self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
-                    print(f"[IsaacSimRunner] Reset pink cup to {pos} (Fixed)")
-                
-                # Blue Cup
-                if 'blue cup' in self.object_prims:
-                     # Base: [4.85, 2.80, 1.0] -> Move to [5.00, 2.80]
-                    jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                    pos = np.array([4.99 + jitter[0], 2.52 + jitter[1], 1.0])
-                    quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                    self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
-                    print(f"[IsaacSimRunner] Reset blue cup to {pos} (Fixed)")
+                # OPTION B: Random Jitter (Fallback or Explicitly requested)
+                else:
+                    print(f"[IsaacSimRunner] Using random jitter mode for episode {episode_idx}")
+                    # Seed for reproducibility per episode
+                    rng = np.random.default_rng(episode_idx)
+                    
+                    # Disable Randomization for Debugging (Set to 0.0)
+                    jitter_scale = 0.0 
+                    
+                    # Pink Cup
+                    if 'pink cup' in self.object_prims:
+                        # Base: [4.85, 2.60, 1.0] -> Move to [5.00, 2.60] (Closer to Robot X=4.99)
+                        jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
+                        pos = np.array([4.70 + jitter[0], 2.60 + jitter[1], 1.0]) 
+                        quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                        self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
+                        print(f"[IsaacSimRunner] Reset pink cup to {pos} (Fixed)")
+                    
+                    # Blue Cup
+                    if 'blue cup' in self.object_prims:
+                         # Base: [4.85, 2.80, 1.0] -> Move to [5.00, 2.80]
+                        jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
+                        pos = np.array([4.99 + jitter[0], 2.52 + jitter[1], 1.0])
+                        quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
+                        self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
+                        print(f"[IsaacSimRunner] Reset blue cup to {pos} (Fixed)")
 
             # --- 2. Settle Physics (Match generate_data.py Phase 2) ---
             print("[Debug] Settling physics for 100 steps...")
             for _ in range(100):
-                self.world.step(render=False) # Faster without rendering, but need one render at end?
-            self.world.step(render=True)
+                # IMPROVEMENT: Use render=True and sleep to match generate_data.py for higher stability
+                self.world.step(render=True)
+                time.sleep(1 / 60)
+            print("[Debug] Physics settled.")
 
             # --- 3. Initialize Robot Pose (Match generate_data.py Phase 3) ---
             # Calibrate Base
@@ -430,9 +494,9 @@ class IsaacSimRunner(BaseImageRunner):
                 self.world.step(render=True)
             # --------------------------------------------------------
             
-            obs_buffer = collections.deque(maxlen=n_obs_steps)
+            obs_buffer = collections.deque(maxlen=self.n_obs_steps)
             # Warm up
-            for _ in range(n_obs_steps):
+            for _ in range(self.n_obs_steps):
                 obs_buffer.append(self.get_obs())
             
             video_frames = []
