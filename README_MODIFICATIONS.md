@@ -51,18 +51,30 @@
 ## 3. 如何執行 (How to Run)
 
 ### 執行 GT Replay (驗證環境與資料對齊)
+
+如果你要測試 `replay_gt` 的軌跡是否與助教一致，請使用以下完整指令：
+
 ```bash
+# 建議使用專用的輸出路徑 v2/v3 以區分實驗結果
 uv run --active voilab eval-model \
-  --checkpoint {CKPT_PATH} \
+  --checkpoint /mnt/zi/00_course/voilab/data/outputs/2026.01.03/19.34.31_train_diffusion_unet_timm_vit_finetune_umi/checkpoints/latest.ckpt \
+  --output_dir data/eval_output_gt_replay_test \
   --task kitchen \
-  --dataset_path {ZARR_PATH} \
+  --dataset_path ./AsiaDragon_All_285/simulation_dataset.zarr.zip \
   --n_episodes 1 \
   --replay_gt \
   --headless
 ```
-*   **新參數說明**:
-    *   `--replay_gt`: 啟用真值重播。此模式下不會使用 Policy 預測，而是直接從 Zarr 抓取 Action 執行。
-    *   `--output_dir`: 若在 Docker 中執行，請務必使用 **相對路徑** (例如 `data/eval_out`)，以確保 Volume Mapping 正確對應到主機。
+
+*   **關鍵參數說明**:
+    *   `--replay_gt`: **核心開關**。啟動後 Runner 會無視 Policy 預測，改為直接播放清單中的 Zarr 真值動作。
+    *   `--dataset_path`: 指向你的 `simulation_dataset.zarr.zip`。
+    *   `--output_dir`: 使用相對路徑，否則 Docker 映射會失效。
+指令重點說明：
+
+--replay_gt: 這是最關鍵的參數，啟動後機器人會忽略模型預測，直接抓取數據集裡的真值動作。如果環境對齊正確，機器人的軌跡應與助教錄製的一致。
+--output_dir: 我特別設定了一個專用的測試路徑，方便你與之前的實驗結果做區隔。
+MSE 指標: 執行完畢後，請觀察 Console 輸出的 Position MSE 與 Rotation MSE，數值越小代表你的環境與助教的真值越吻合。
 
 ### 數據集狀態檢視
 ```bash
