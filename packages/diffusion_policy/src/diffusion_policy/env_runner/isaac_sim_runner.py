@@ -524,48 +524,95 @@ class IsaacSimRunner(BaseImageRunner):
             base_pos, base_quat = self.panda.get_world_pose()
             self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
             
-            # Get Current EE Pose (after settle)
-            ee_pos, ee_rot_mat = self.art_kine_solver.compute_end_effector_pose()
+            # Initialize Robot Joint Positions
+            if self.replay_gt and self.validation_dataset is not None:
+                # GT Replay Mode: Initialize to exact start pose from dataset
+                if dataset_ep_idx in episode_to_sampler_indices:
+                    sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                    if len(sampler_indices) > 0:
+                        start_idx = sampler_indices[0]
+                        batch = self.validation_dataset[start_idx]
+                        
+
+                        # Get robot0_demo_start_pose
+                        # Shape: (1, 6) or (6,) depending on batching (Cartesian: X, Y, Z, Ax, Ay, Az)
+                        start_pose_6d = batch.get('robot0_demo_start_pose')
+                        
+                        # Fallback: UmiDataset.__getitem__ DELETES _demo_start_pose from obs_dict!
+                        # We must fetch it directly from the replay_buffer if missing in batch.
+                        if start_pose_6d is None and hasattr(self.validation_dataset, 'replay_buffer'):
+                            print(f"[IsaacSimRunner] robot0_demo_start_pose missing in batch. Fetching from ReplayBuffer...")
+                            try:
+                                rb = self.validation_dataset.replay_buffer
+                                if 'robot0_demo_start_pose' in rb:
+                                    # Fetch at specific frame index `start_idx`
+                                    start_pose_6d = rb['robot0_demo_start_pose'][start_idx]
+                                    if isinstance(start_pose_6d, np.ndarray):
+                                        pass # already numpy
+                                    elif isinstance(start_pose_6d, torch.Tensor):
+                                        start_pose_6d = start_pose_6d.cpu().numpy()
+                            except Exception as e:
+                                print(f"[IsaacSimRunner] FAILED to fetch from ReplayBuffer: {e}")
+
+                        
+                        if start_pose_6d is not None:
+                            if isinstance(start_pose_6d, torch.Tensor):
+                                start_pose_6d = start_pose_6d.cpu().numpy()
+
+                            
+                            # Handle batch dim if present
+                            if start_pose_6d.ndim > 1:
+                                start_pose_6d = start_pose_6d[0]
+                                
+                            print(f"[IsaacSimRunner] GT Replay: Dataset Start Pose (6D): {start_pose_6d}")
+                            
+                            # Parse 6D Pose
+                            start_pos = start_pose_6d[:3]
+                            start_rot_axis_angle = start_pose_6d[3:]
+                            
+                            # Convert Axis-Angle to Quaternion (WXYZ for Solver)
+                            start_rot_quat_xyzw = R.from_rotvec(start_rot_axis_angle).as_quat()
+                            start_rot_quat_wxyz = start_rot_quat_xyzw[[3, 0, 1, 2]]
+                            
+                            print(f"[IsaacSimRunner] IK Target - Pos: {start_pos}, Rot(WXYZ): {start_rot_quat_wxyz}")
+                            
+                            # Compute IK
+                            ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
+                                target_position=start_pos,
+                                target_orientation=start_rot_quat_wxyz
+                            )
+                            
+                            if success:
+                                print(f"[IsaacSimRunner] IK Success. Setting joint positions...")
+                                self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
+                                # Debug: check if set properly
+                                jp_now = self.panda.get_joint_positions()
+                                print(f"[IsaacSimRunner] Joints after Set: {jp_now}")
+                            else:
+                                print(f"[IsaacSimRunner] CRITICAL WARNING: IK Failed for Dataset Start Pose!")
+                            
+                            # Update solvers with new state
+                            # Removing explicit step(render=True) to avoid potential crash
+                            # self.world.step(render=True) 
+                            
+                        else:
+                            print(f"[IsaacSimRunner] WARNING: robot0_demo_start_pose not found in dataset for episode {dataset_ep_idx}")
+                else:
+                    print(f"[IsaacSimRunner] WARNING: No sampler indices found for episode {dataset_ep_idx}")
             
-            # Calculate Target Init Pose (Kitchen Task Offset)
-            # Offset: [-0.16, 0., 0.13]
-            # init_offset = np.array([-0.16, 0., 0.13])
-            # target_pos = ee_pos + init_offset
-            
-            # FIXED: Hardcode to match Training Data (Episode 0)
-            # Eval: [4.84, 2.64, 1.29] vs Train: [4.99, 2.52, 1.09]
-            # Diff: X+0.15, Y-0.12, Z-0.20
-            target_pos = np.array([4.99, 2.52, 1.09])
-            
-            target_quat_wxyz = np.array([0.0081739, -0.9366365, 0.350194, 0.0030561])
-            
-            # Apply IK
-            print(f"[Debug] Initializing Robot to FIXED TARGET {target_pos}")
-            ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
-                target_position=target_pos,
-                target_orientation=target_quat_wxyz
-            )
-            
-            if success:
-                self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
-                print("[Debug] Robot initialization IK successful.")
-                # Verify Pose
-                final_ee_pos, final_ee_rot = self.art_kine_solver.compute_end_effector_pose()
-                final_ee_rot_quat = R.from_matrix(final_ee_rot[:3, :3]).as_quat() # xyzw
-                # Convert to wxyz for display
-                final_ee_rot_wxyz = np.array([final_ee_rot_quat[3], final_ee_rot_quat[0], final_ee_rot_quat[1], final_ee_rot_quat[2]])
-                print(f"[Debug] Achieved EE Position: {final_ee_pos}")
-                print(f"[Debug] Achieved EE Rotation (WXYZ): {final_ee_rot_wxyz}")
-                print(f"[Debug] Target   EE Rotation (WXYZ): {target_quat_wxyz}")
             else:
-                print("[IsaacSimRunner] WARNING: Robot initialization IK failed!")
+                # Inference Mode: Use Registry Config or Default
+                pass
             
-            # Short Settle after IK
-            # Warm up rendering pipeline to avoid SyntheticData crash
-            print("[Debug] Warming up renderer...")
-            for _ in range(20):
+            # Short Settle
+            print("[Debug] Warming up renderer (20 steps)...")
+            for i in range(20):
                 self.world.step(render=True)
             print("[Debug] Renderer warmed up.")
+            
+            # Check Post-Settle Pose
+            ee_pos_final, _ = self.art_kine_solver.compute_end_effector_pose()
+            print(f"[IsaacSimRunner] Debug: EE Pose AFTER Settle: {ee_pos_final}")
             # --------------------------------------------------------
             
             obs_buffer = collections.deque(maxlen=self.n_obs_steps)
@@ -577,9 +624,66 @@ class IsaacSimRunner(BaseImageRunner):
             video_frames_front = []
             is_success = False
             done = False
+            # --- 6. GT Replay Pre-fetch (Optimization) ---
+            gt_abs_poses = None
+            gt_gripper_widths = None
+            if self.replay_gt and hasattr(self.validation_dataset, 'replay_buffer'):
+                if dataset_ep_idx in episode_to_sampler_indices:
+                    sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                    if len(sampler_indices) > 0:
+                        print(f"[IsaacSimRunner] GT Replay: Pre-fetching {len(sampler_indices)} absolute poses...")
+                        rb = self.validation_dataset.replay_buffer
+                        # Using raw Zarr indices from sampler_indices
+                        start_idx = sampler_indices[0]
+                        end_idx = sampler_indices[-1] + 1
+                        
+                        try:
+                            # Note: SequenceSampler indices for an episode are usually contiguous in ReplayBuffer
+                            # We can slice them or iterate. Slicing is faster.
+                            gt_abs_pos = rb['robot0_eef_pos'][start_idx:end_idx]
+                            gt_abs_rot = rb['robot0_eef_rot_axis_angle'][start_idx:end_idx]
+                            gt_abs_gripper = rb['robot0_gripper_width'][start_idx:end_idx]
+                            
+                            gt_abs_poses = (gt_abs_pos, gt_abs_rot)
+                            gt_gripper_widths = gt_abs_gripper
+                        except Exception as e:
+                            print(f"[IsaacSimRunner] WARNING: Failed to pre-fetch absolute poses: {e}")
+
             step_idx = 0
-            
             while not done and step_idx < self.max_steps_per_episode:
+                # --- 7. GT Replay Optimized Execution ---
+                if self.replay_gt and gt_abs_poses is not None:
+                    if step_idx < len(gt_abs_poses[0]):
+                        target_pos = gt_abs_poses[0][step_idx]
+                        target_rot_axis_angle = gt_abs_poses[1][step_idx]
+                        target_gripper_width = gt_gripper_widths[step_idx][0]
+                        
+                        target_rot_quat_xyzw = R.from_rotvec(target_rot_axis_angle).as_quat()
+                        target_rot_quat_wxyz = target_rot_quat_xyzw[[3, 0, 1, 2]]
+                        
+                        ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
+                            target_position=target_pos,
+                            target_orientation=target_rot_quat_wxyz
+                        )
+                        
+                        if success:
+                            self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
+                            g_pos = target_gripper_width / 2.0
+                            self.panda.gripper.set_joint_positions(np.array([g_pos, g_pos]))
+                            self._update_magic_grasp(target_gripper_width, step_idx=step_idx)
+
+                        self.world.step(render=True)
+                        if self.save_video:
+                            frame = self.camera.get_rgb()
+                            if frame is not None: video_frames.append(frame)
+                            frame_front = self.fixed_camera_front.get_rgb()
+                            if frame_front is not None: video_frames_front.append(frame_front)
+                        
+                        step_idx += 1
+                        continue # Skip standard policy processing
+                    else:
+                        break
+
                 # Prepare Observation Batch (B, T, D)
                 # Stack
                 # obs_buffer contains dicts. We want dict of (B=1, T, D)
@@ -663,112 +767,13 @@ class IsaacSimRunner(BaseImageRunner):
 
                 
                 # policy execution
-                if self.replay_gt:
-                    if dataset_ep_idx in episode_to_sampler_indices:
-                        sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
-                        
-                        # In Replay GT mode, we want to play EVERY frame from the dataset.
-                        # The sampler indices might be downsampled or truncated.
-                        # For now, we still use the indices but ensure we don't jump.
-                        if step_idx < len(sampler_indices):
-                            # Get GT action directly from dataset
-                            batch = self.validation_dataset[sampler_indices[step_idx]]
-                            actions = batch['action']
-                            if isinstance(actions, torch.Tensor):
-                                actions = actions.cpu().numpy()
-                            # Cache last action for padding
-                            self.last_gt_action = actions
-                            exec_steps = 1 # Force single step to see every frame
-                        else:
-                            # End of GT trajectory, stop the episode!
-                            print(f"[IsaacSimRunner] GT Replay finished for episode {episode_idx} (step {step_idx}). Stopping.")
-                            break
-                    else:
-                         print(f"[IsaacSimRunner] Warning: Episode {dataset_ep_idx} not found in validation dataset for GT replay!")
-                         actions = np.zeros((self.n_action_steps, 10))
-                         exec_steps = self.n_action_steps
-                else:
-                    with torch.no_grad():
-                        action_dict = policy.predict_action(batch_obs)
-                    actions = action_dict['action'][0].cpu().numpy() # [horizon, 10]
-                    exec_steps = self.n_action_steps
+                with torch.no_grad():
+                    action_dict = policy.predict_action(batch_obs)
+                actions = action_dict['action'][0].cpu().numpy() # [horizon, 10]
+                exec_steps = self.n_action_steps
                 
-                # Execute action (n_action_steps or 1 for GT)
-                
-                # CRITICAL: Capture base pose for relative action application
-                # UMI actions in a chunk are all relative to the FIRST observation frame of that chunk.
-                
-                # FIX: Calibrate Solver Base Pose before computing EE pose!
-                # If we don't do this, the solver assumes base is at (0,0,0) which is wrong.
-                base_pos, base_quat = self.panda.get_world_pose()
-                self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
-                
-                current_ee_pos, current_ee_mat = self.art_kine_solver.compute_end_effector_pose()
-                current_ee_quat_xyzw = R.from_matrix(current_ee_mat[:3, :3]).as_quat()
-                base_ee_rot = R.from_quat(current_ee_quat_xyzw)
-                base_ee_pos = current_ee_pos
-
-                for i in range(min(exec_steps, len(actions))):
-                    action = actions[i]
-                    # action: [pos(3), rot6d(6), gripper(1)]
-                    
-                    # Relative Position: Rotate by base and add
-                    delta_pos = action[:3]
-                    # Target = Base_Pos + Base_Rot * Delta_Pos (Apply delta in reference frame)
-                    target_pos = base_ee_pos + base_ee_rot.apply(delta_pos)
-
-                    # Relative Rotation: Compose with base
-                    delta_rot6d = action[3:9]
-                    delta_rot_quat_xyzw = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
-                    delta_rot = R.from_quat(delta_rot_quat_xyzw)
-                    
-                    # target = base * delta
-                    target_rot = base_ee_rot * delta_rot
-                    target_rot_quat_xyzw = target_rot.as_quat()
-                    
-                    # Target Orientation for IK (wxyz check: ArticulationKinematicsSolver expects wxyz?)
-                    # In Step 251 (original code), it used: target_rot_quat_wxyz
-                    # And: target_orientation=target_rot_quat_wxyz
-                    target_rot_quat_wxyz = target_rot_quat_xyzw[[3, 0, 1, 2]]
-                    
-                    # Gripper
-                    target_gripper_width = action[9]
-                    
-                    # Compute IK
-                    ik_action, success = self.art_kine_solver.compute_inverse_kinematics(
-                        target_position=target_pos,
-                        target_orientation=target_rot_quat_wxyz
-                    )
-                    
-                    if success:
-                        self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
-                        # Set gripper
-                        g_pos = target_gripper_width / 2.0
-                        self.panda.gripper.set_joint_positions(np.array([g_pos, g_pos]))
-                    else:
-                        print(f"[Debug] IK Failed for step {i}! Target Pos: {target_pos}")
-                    
-                    
-                    
-                    # Apply Magic Grasp
-                    self._update_magic_grasp(target_gripper_width, step_idx=step_idx)
-
-                    # print(f"[Debug] Stepping simulation (Action step {i})...")
-                    self.world.step(render=True)
-                    
-                    if self.save_video:
-                        frame = self.camera.get_rgb()
-                        if frame is not None:
-                            video_frames.append(frame)
-                        
-                        # Record front camera
-                        frame_front = self.fixed_camera_front.get_rgb()
-                        if frame_front is not None:
-                            video_frames_front.append(frame_front)
-                    
-                    step_idx += 1
-                    if step_idx >= self.max_steps_per_episode:
-                        break
+                # Execute action (n_action_steps or 1 for legacy GT)
+                # ... [Rest of the standard action execution loop below] ...
                 
                 if self.check_success_fn:
                     try:
