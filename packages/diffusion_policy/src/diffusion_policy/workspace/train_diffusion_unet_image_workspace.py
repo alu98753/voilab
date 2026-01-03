@@ -117,7 +117,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
-
+                # # --- 新增以下這段修復 來成功resume training ---
+                # for group in self.optimizer.param_groups:
+                #     if 'initial_lr' not in group:
+                #         group['initial_lr'] = group.get('lr', cfg.optimizer.lr)
+                # # --------------------------
         # configure dataset
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)

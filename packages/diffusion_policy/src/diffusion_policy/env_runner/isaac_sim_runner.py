@@ -37,8 +37,8 @@ class IsaacSimRunner(BaseImageRunner):
         max_steps_per_episode: int = 200,
         n_obs_steps: int = 2,
         n_action_steps: int = 8,
-        urdf_path: str = "/workspace/voilab/assets/franka_panda/franka_panda_umi-isaacsim.urdf",
-        usd_path: str = "/workspace/voilab/assets/ED305_scene/ED305.usd",
+        urdf_path: str = None, # Set dynamically
+        usd_path: str = None,  # Set dynamically
         headless: bool = True,
         save_video: bool = True,
         save_observation_data: bool = False,
@@ -72,10 +72,19 @@ class IsaacSimRunner(BaseImageRunner):
         self.validation_dataset = validation_dataset
         self.replay_gt = replay_gt
 
+        # Detect project root
+        self.project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))))
+        print(f"[IsaacSimRunner] Project Root detected: {self.project_root}")
+
+        if self.urdf_path is None:
+            self.urdf_path = os.path.join(self.project_root, "assets/franka_panda/franka_panda_umi-isaacsim.urdf")
+        if self.usd_path is None:
+            self.usd_path = os.path.join(self.project_root, "assets/ED305_scene/ED305.usd")
+
         # Robot config
-        self.franka_panda_usd = "/workspace/voilab/assets/franka_panda/franka_panda_arm.usd"
+        self.franka_panda_usd = os.path.join(self.project_root, "assets/franka_panda/franka_panda_arm.usd")
         self.franka_prim_path = "/World/Franka"
-        self.lula_robot_description_path = "/workspace/voilab/assets/lula/frank_umi_descriptor.yaml"
+        self.lula_robot_description_path = os.path.join(self.project_root, "assets/lula/frank_umi_descriptor.yaml")
         # Use Wrist Camera (GoPro) as expected by UMI Policy
         self.camera_prim_path = "/World/Franka/panda/panda_link7/gopro_link/Camera"
 
@@ -132,22 +141,12 @@ class IsaacSimRunner(BaseImageRunner):
         robot_prim.GetVariantSet("Mesh").SetVariantSelection("Quality")
         
         if self.registry_config:
-            # 1. Apply Robot Pose
-            franka_pose = self.registry_config.get("franka_pose", {})
-            trans = franka_pose.get("translation")
-            rot = franka_pose.get("rotation_quat")
-            if trans is not None and rot is not None:
-                print(f"[Debug] Setting Registry Robot Pose: {trans}")
-                robot_xform = SingleXFormPrim(prim_path=self.franka_prim_path)
-                robot_xform.set_local_pose(
-                    translation=np.array(trans) / stage_utils.get_stage_units(),
-                    orientation=np.array(rot)
-                )
-
+            # Poses are now applied in _reset_robot_pose() after World.reset()
+            # This ensures they persist across episode restarts
             # 2. Load Preload Objects
             env_vars = self.registry_config.get("environment_vars", {})
             preload_objects = env_vars.get("PRELOAD_OBJECTS", [])
-            ASSETS_DIR = "/workspace/voilab/assets/CADs"
+            ASSETS_DIR = os.path.join(self.project_root, "assets/CADs")
             self.object_prims = {}
             
             for entry in preload_objects:
@@ -261,6 +260,33 @@ class IsaacSimRunner(BaseImageRunner):
     def set_registry_config(self, config: Dict):
         self.registry_config = config
         print("[Debug] IsaacSimRunner: Registry config set.")
+
+    def _reset_robot_pose(self):
+        """Applies registry-defined robot pose. Must be called after world.reset()."""
+        if self.registry_config and self.panda:
+            franka_pose = self.registry_config.get("franka_pose", {})
+            trans = franka_pose.get("translation")
+            rot = franka_pose.get("rotation_quat")
+            if trans is not None and rot is not None:
+                stage_units = stage_utils.get_stage_units()
+                target_trans = np.array(trans) / stage_units
+                print(f"[IsaacSimRunner] Resetting Robot Base Pose to: {target_trans}")
+                
+                # Use the XFormPrim to move the base
+                robot_xform = SingleXFormPrim(prim_path=self.franka_prim_path)
+                robot_xform.set_local_pose(
+                    translation=target_trans,
+                    orientation=np.array(rot)
+                )
+                
+                # FORCE update of prim to ensure solver sees it
+                omni.kit.app.get_app().update()
+
+                # Also update Lula solver to match new base!
+                self.lula_solver.set_robot_base_pose(
+                    robot_position=target_trans,
+                    robot_orientation=np.array(rot)
+                )
 
     def _update_magic_grasp(self, action_gripper_width: float, step_idx: int = 0):
         """
@@ -405,15 +431,32 @@ class IsaacSimRunner(BaseImageRunner):
             dataset = self.validation_dataset
             episode_ends = dataset.replay_buffer.episode_ends[:]
             for i in range(len(dataset)):
-                _, _, end_idx, _ = dataset.sampler.indices[i]
-                ep_idx = bisect.bisect_left(episode_ends, end_idx)
+                start_ptr, end_ptr, _, _ = dataset.sampler.indices[i]
+                # Find which episode this segment belongs to
+                ep_idx = bisect.bisect_right(episode_ends, start_ptr)
                 if ep_idx not in episode_to_sampler_indices:
-                    episode_to_sampler_indices[ep_idx] = []
-                episode_to_sampler_indices[ep_idx].append(i)
+                    ep_start = episode_ends[ep_idx-1] if ep_idx > 0 else 0
+                    ep_end = episode_ends[ep_idx]
+                    episode_to_sampler_indices[ep_idx] = {
+                        'sampler_indices': [],
+                        'rb_range': (ep_start, ep_end)
+                    }
+                episode_to_sampler_indices[ep_idx]['sampler_indices'].append(i)
             print(f"[IsaacSimRunner] Pre-indexed {len(episode_to_sampler_indices)} episodes from validation dataset for MSE calculation")
         
+        # Pre-load object poses JSON to match indices correctly
+        object_poses_data = []
+        if self.use_recorded_poses and self.object_poses_path and os.path.exists(self.object_poses_path):
+            try:
+                import json
+                with open(self.object_poses_path, 'r') as f:
+                    object_poses_data = json.load(f)
+                    if not isinstance(object_poses_data, list):
+                        object_poses_data = [object_poses_data]
+            except Exception as e:
+                print(f"[IsaacSimRunner] WARNING: Failed to load object poses JSON: {e}")
         if self.replay_gt and self.validation_dataset is None:
-             raise ValueError("replay_gt=True requires validation_dataset to be passed to IsaacSimRunner.")
+            raise ValueError("replay_gt=True requires validation_dataset to be passed to IsaacSimRunner.")
 
         all_episode_stats = []
         
@@ -432,11 +475,14 @@ class IsaacSimRunner(BaseImageRunner):
         for i, (episode_idx, dataset_ep_idx) in enumerate(zip(ep_indices, dataset_ep_indices)):
             logger.info(f"[IsaacSimRunner] Starting episode {i+1}/{len(ep_indices)} (sim_idx: {episode_idx}, dataset_idx: {dataset_ep_idx})")
             self.world.reset()
+            # FIX: Re-apply Robot Base Pose after world reset!
+            self._reset_robot_pose()
+            
             # Render once to get valid camera data
             self.world.step(render=True)
             self.start_eef_rot_quat = None
             policy.reset()
-            print(f"[Debug] Episode {episode_idx+1}: World reset done.")
+            print(f"[Debug] Episode {episode_idx+1}: World reset & Robot pose applied.")
 
 
             # --- 1. Reset Objects (Match generate_data.py Phase 1) ---
@@ -445,15 +491,28 @@ class IsaacSimRunner(BaseImageRunner):
                 if self.use_recorded_poses and self.object_poses_path and os.path.exists(self.object_poses_path):
                     try:
                         from object_loader import load_object_transforms_from_json
+                        
+                        # CORRECT INDEX MAPPING: Find the JSON entry that matches our RB frame range
+                        json_idx = episode_idx # Fallback
+                        if dataset_ep_idx in episode_to_sampler_indices:
+                            rb_start = episode_to_sampler_indices[dataset_ep_idx]['rb_range'][0]
+                            for j, entry in enumerate(object_poses_data):
+                                ep_range = entry.get('episode_range', [0, 0])
+                                if ep_range[0] <= rb_start < ep_range[1]:
+                                    json_idx = j
+                                    print(f"[IsaacSimRunner] Map dataset_idx {dataset_ep_idx} (start frame {rb_start}) -> JSON index {json_idx}")
+                                    break
+
                         object_transforms = load_object_transforms_from_json(
                             self.object_poses_path,
-                            episode_index=episode_idx,
+                            episode_index=json_idx,
                             aruco_tag_pose=self.registry_config.get("aruco_tag_pose") if self.registry_config else None,
                             cfg=self.registry_config,
                         )
                         
                         if len(object_transforms) > 0:
-                            print(f"[IsaacSimRunner] Loading recorded poses for episode {episode_idx}")
+                            print(f"[IsaacSimRunner] Loaded {len(object_transforms)} object transforms from JSON index {json_idx} for sim_episode {episode_idx}")
+                            print(f"[IsaacSimRunner] Loading recorded poses for sim_episode {episode_idx}")
                             for obj in object_transforms:
                                 obj_name = self._normalize_object_name(obj["object_name"])
                                 if obj_name in self.object_prims:
@@ -528,12 +587,14 @@ class IsaacSimRunner(BaseImageRunner):
             if self.replay_gt and self.validation_dataset is not None:
                 # GT Replay Mode: Initialize to exact start pose from dataset
                 if dataset_ep_idx in episode_to_sampler_indices:
-                    sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                    info = episode_to_sampler_indices[dataset_ep_idx]
+                    sampler_indices = info['sampler_indices']
+                    rb_start, rb_end = info['rb_range']
+                    
                     if len(sampler_indices) > 0:
-                        start_idx = sampler_indices[0]
-                        batch = self.validation_dataset[start_idx]
+                        start_sampler_idx = sampler_indices[0]
+                        batch = self.validation_dataset[start_sampler_idx]
                         
-
                         # Get robot0_demo_start_pose
                         # Shape: (1, 6) or (6,) depending on batching (Cartesian: X, Y, Z, Ax, Ay, Az)
                         start_pose_6d = batch.get('robot0_demo_start_pose')
@@ -545,8 +606,8 @@ class IsaacSimRunner(BaseImageRunner):
                             try:
                                 rb = self.validation_dataset.replay_buffer
                                 if 'robot0_demo_start_pose' in rb:
-                                    # Fetch at specific frame index `start_idx`
-                                    start_pose_6d = rb['robot0_demo_start_pose'][start_idx]
+                                    # Fetch at specific frame index `rb_start`
+                                    start_pose_6d = rb['robot0_demo_start_pose'][rb_start]
                                     if isinstance(start_pose_6d, np.ndarray):
                                         pass # already numpy
                                     elif isinstance(start_pose_6d, torch.Tensor):
@@ -629,28 +690,30 @@ class IsaacSimRunner(BaseImageRunner):
             gt_gripper_widths = None
             if self.replay_gt and hasattr(self.validation_dataset, 'replay_buffer'):
                 if dataset_ep_idx in episode_to_sampler_indices:
-                    sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
-                    if len(sampler_indices) > 0:
-                        print(f"[IsaacSimRunner] GT Replay: Pre-fetching {len(sampler_indices)} absolute poses...")
-                        rb = self.validation_dataset.replay_buffer
-                        # Using raw Zarr indices from sampler_indices
-                        start_idx = sampler_indices[0]
-                        end_idx = sampler_indices[-1] + 1
+                    info = episode_to_sampler_indices[dataset_ep_idx]
+                    start_idx, end_idx = info['rb_range']
+                    
+                    print(f"[IsaacSimRunner] GT Replay: Replaying full episode for dataset_idx {dataset_ep_idx}")
+                    rb = self.validation_dataset.replay_buffer
+                    print(f"[IsaacSimRunner] GT Replay: Pre-fetching {end_idx - start_idx} absolute poses (RB indices {start_idx} to {end_idx})...")
                         
-                        try:
-                            # Note: SequenceSampler indices for an episode are usually contiguous in ReplayBuffer
-                            # We can slice them or iterate. Slicing is faster.
-                            gt_abs_pos = rb['robot0_eef_pos'][start_idx:end_idx]
-                            gt_abs_rot = rb['robot0_eef_rot_axis_angle'][start_idx:end_idx]
-                            gt_abs_gripper = rb['robot0_gripper_width'][start_idx:end_idx]
-                            
-                            gt_abs_poses = (gt_abs_pos, gt_abs_rot)
-                            gt_gripper_widths = gt_abs_gripper
-                        except Exception as e:
-                            print(f"[IsaacSimRunner] WARNING: Failed to pre-fetch absolute poses: {e}")
+                    try:
+                        # Note: SequenceSampler indices for an episode are usually contiguous in ReplayBuffer
+                        # We can slice them or iterate. Slicing is faster.
+                        gt_abs_pos = rb['robot0_eef_pos'][start_idx:end_idx]
+                        gt_abs_rot = rb['robot0_eef_rot_axis_angle'][start_idx:end_idx]
+                        gt_abs_gripper = rb['robot0_gripper_width'][start_idx:end_idx]
+                        
+                        gt_abs_poses = (gt_abs_pos, gt_abs_rot)
+                        gt_gripper_widths = gt_abs_gripper
+                    except Exception as e:
+                        print(f"[IsaacSimRunner] WARNING: Failed to pre-fetch absolute poses: {e}")
 
+            # GT Replay Limit: Ignore max_steps_per_episode, use actual length
+            step_limit = len(gt_abs_poses[0]) if (self.replay_gt and gt_abs_poses is not None) else self.max_steps_per_episode
+            
             step_idx = 0
-            while not done and step_idx < self.max_steps_per_episode:
+            while not done and step_idx < step_limit:
                 # --- 7. GT Replay Optimized Execution ---
                 if self.replay_gt and gt_abs_poses is not None:
                     if step_idx < len(gt_abs_poses[0]):
@@ -670,7 +733,20 @@ class IsaacSimRunner(BaseImageRunner):
                             self.panda.set_joint_positions(ik_action.joint_positions, np.arange(7))
                             g_pos = target_gripper_width / 2.0
                             self.panda.gripper.set_joint_positions(np.array([g_pos, g_pos]))
+                            
+                            # Debug: Verify reachability every 10 steps
+                            if step_idx % 10 == 0:
+                                curr_ee_pos, _ = self.art_kine_solver.compute_end_effector_pose()
+                                dist = np.linalg.norm(curr_ee_pos - target_pos)
+                                if dist > 0.02:
+                                    print(f"[Warning] GT Replay Step {step_idx}: Actual EE pos {curr_ee_pos} is {dist:.4f}m away from target {target_pos}")
+                                else:
+                                    print(f"[Debug] GT Replay Step {step_idx}: Reached {curr_ee_pos} (Target {target_pos})")
+                            
                             self._update_magic_grasp(target_gripper_width, step_idx=step_idx)
+                        else:
+                            if step_idx % 50 == 0:
+                                print(f"[IsaacSimRunner] GT Replay: IK Failed at step {step_idx}. Target: {target_pos}")
 
                         self.world.step(render=True)
                         if self.save_video:
@@ -810,7 +886,8 @@ class IsaacSimRunner(BaseImageRunner):
             # Calculate Dataset MSE for this episode
             episode_mse = {}
             if self.validation_dataset is not None and dataset_ep_idx in episode_to_sampler_indices:
-                sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                info = episode_to_sampler_indices[dataset_ep_idx]
+                sampler_indices = info['sampler_indices']
                 from torch.utils.data import Subset, DataLoader
                 import torch.nn.functional as F
                 

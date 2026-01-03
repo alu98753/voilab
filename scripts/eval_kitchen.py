@@ -26,10 +26,19 @@ python scripts/eval_kitchen.py \
 """
 
 import sys
-import click
-import numpy as np # RESTORED: Isaac Sim might need numpy pre-loaded
 import os
 import pathlib
+
+# Detect project root
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Force load from source to ensure edits to packages are reflected
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "packages/diffusion_policy/src"))
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "packages/umi/src"))
+print(f"[Eval] Project Root: {PROJECT_ROOT}")
+print(f"[Eval] sys.path[0]: {sys.path[0]}")
+
+import click
+import numpy as np # RESTORED: Isaac Sim might need numpy pre-loaded
 
 # Initialize Isaac Sim early to avoid segfaults
 # CRITICAL: This must happen before any torch imports!
@@ -60,8 +69,10 @@ sys.argv = original_argv
 
 
 
+# Already detected above
+
 # Fix HF Cache issue (Disk full)
-os.environ['HF_HOME'] = '/workspace/voilab/data/.cache/huggingface'
+os.environ['HF_HOME'] = os.path.join(PROJECT_ROOT, 'data/.cache/huggingface')
 os.makedirs(os.environ['HF_HOME'], exist_ok=True)
 print(f"[Eval] Set HF_HOME to: {os.environ['HF_HOME']}")
 
@@ -73,9 +84,7 @@ import json
 
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-# Force load from source to ensure edits to packages are reflected
-sys.path.insert(0, "/workspace/voilab/packages/diffusion_policy/src")
-sys.path.insert(0, "/workspace/voilab/packages/umi/src")
+# Already set above
 
 import diffusion_policy
 
