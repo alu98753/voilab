@@ -114,7 +114,8 @@ def launch_simulator(task, session_dir, episode, width, height):
 @click.option('--n_episodes', default=10, type=int, help='Number of evaluation episodes')
 @click.option('--headless', is_flag=True, help='Run in headless mode (no GUI)')
 @click.option('--device', default='cuda:0', help='Device to run on (cuda:0, cpu, etc.)')
-def eval_model(checkpoint, output_dir, task, dataset_path, n_episodes, headless, device):
+@click.option('--replay_gt', is_flag=True, help='Replay Ground Truth from dataset instead of running policy')
+def eval_model(checkpoint, output_dir, task, dataset_path, n_episodes, headless, device, replay_gt):
     """Evaluate trained Diffusion Policy model in Isaac Sim environment"""
     try:
         # Prepare environment
@@ -132,7 +133,7 @@ def eval_model(checkpoint, output_dir, task, dataset_path, n_episodes, headless,
             "TASK_NAME": task,
         })
         
-        click.echo(f"[CLI] Evaluating model: checkpoint={checkpoint}, task={task}, n_episodes={n_episodes}")
+        click.echo(f"[CLI] Evaluating model: checkpoint={checkpoint}, task={task}, n_episodes={n_episodes}, replay_gt={replay_gt}")
         
         # Get project root
         script_dir = Path(__file__).parent.parent.parent
@@ -168,6 +169,8 @@ def eval_model(checkpoint, output_dir, task, dataset_path, n_episodes, headless,
         
         if headless:
             cmd_args.append("--headless")
+        if replay_gt:
+            cmd_args.append("--replay_gt")
         if container_dataset_path:
             cmd_args.extend(["--dataset_path", container_dataset_path])
         

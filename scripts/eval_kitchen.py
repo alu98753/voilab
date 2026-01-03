@@ -96,7 +96,8 @@ print("[Eval] All imports completed (delayed diffusion_policy load).", flush=Tru
               help='Config name to use')
 @click.option('--config-path', default='packages/diffusion_policy/src/diffusion_policy/config',
               help='Path to config directory')
-def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headless, random_poses, config_name, config_path):
+@click.option('--replay_gt', is_flag=True, help='Replay Ground Truth from dataset instead of running policy')
+def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headless, random_poses, config_name, config_path, replay_gt):
     """
     評估訓練好的 Diffusion Policy 模型（僅使用 Validation Episodes）
     
@@ -149,6 +150,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     if dataset_path:
         print(f"[Eval] Dataset path: {dataset_path}")
     print(f"[Eval] Evaluation mode: {'Random Poses' if random_poses else 'Recorded Poses'}")
+    print(f"[Eval] Replay GT: {replay_gt}")
     print(f"[Eval] ==============================================")
     
     # Load checkpoint
@@ -385,6 +387,12 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     # Pass validation dataset for MSE calculation
     if val_dataset is not None and 'validation_dataset' in sig.parameters:
         runner_kwargs['validation_dataset'] = val_dataset
+        
+    if replay_gt and 'replay_gt' in sig.parameters:
+        runner_kwargs['replay_gt'] = True
+        # Set a very high limit; the runner will break exactly when GT actions end
+        runner_kwargs['max_steps_per_episode'] = 10000 
+        print(f"[Eval] Enabling GT Replay Mode (max_steps extended to 10000)")
     
     # Instantiate env runner
     print(f"\n[Eval] Creating environment runner: {env_runner_cfg['_target_']}")

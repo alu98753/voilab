@@ -25,7 +25,9 @@ from isaacsim.robot.manipulators import SingleManipulator
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver, ArticulationKinematicsSolver
 from isaacsim.storage.native import get_assets_root_path
+from isaacsim.storage.native import get_assets_root_path
 from isaacsim.sensors.camera import Camera
+import omni.kit.app
 
 class IsaacSimRunner(BaseImageRunner):
     def __init__(
@@ -45,6 +47,7 @@ class IsaacSimRunner(BaseImageRunner):
         episode_indices: Optional[List[int]] = None,
         dataset_episode_indices: Optional[List[int]] = None,
         validation_dataset: Optional[Any] = None,
+        replay_gt: bool = False,
         **kwargs
     ):
         super().__init__(output_dir)
@@ -55,13 +58,19 @@ class IsaacSimRunner(BaseImageRunner):
         self.urdf_path = urdf_path
         self.usd_path = usd_path
         self.headless = headless
-        self.save_video = save_video
+        self.replay_gt = replay_gt
+        # Force video recording if GT Replay is enabled, as visual verification is critical
+        if self.replay_gt:
+            self.save_video = True
+        else:
+            self.save_video = save_video
         self.save_observation_data = save_observation_data
         self.use_recorded_poses = use_recorded_poses
         self.object_poses_path = object_poses_path
         self.episode_indices = episode_indices
         self.dataset_episode_indices = dataset_episode_indices
         self.validation_dataset = validation_dataset
+        self.replay_gt = replay_gt
 
         # Robot config
         self.franka_panda_usd = "/workspace/voilab/assets/franka_panda/franka_panda_arm.usd"
@@ -98,10 +107,17 @@ class IsaacSimRunner(BaseImageRunner):
         # Enable necessary extensions
         print("[Debug] Enabling extensions...")
         enable_extension("isaacsim.robot_motion.motion_generation")
+        
+        # FIX: Update App to ensure extensions are loaded before Stage access
+        omni.kit.app.get_app().update()
 
         # Open stage
         print(f"[Debug] Opening stage: {self.usd_path}")
         stage_utils.open_stage(self.usd_path)
+        
+        # FIX: Update App to ensure Stage is loaded before World creation
+        omni.kit.app.get_app().update()
+        
         print("[Debug] Stage opened. Creating World...")
         self.world = World(stage_units_in_meters=1.0)
         self.world.scene.add_default_ground_plane()
@@ -109,6 +125,11 @@ class IsaacSimRunner(BaseImageRunner):
         # Add robot
         print(f"[Debug] Adding robot from: {self.franka_panda_usd}")
         robot_prim = stage_utils.add_reference_to_stage(usd_path=self.franka_panda_usd, prim_path=self.franka_prim_path)
+        
+        # FIX: Select AlternateFinger and Quality variants to match generate_data.py
+        # This ensures the physical structure and TCP offsets match the UMI dataset.
+        robot_prim.GetVariantSet("Gripper").SetVariantSelection("AlternateFinger")
+        robot_prim.GetVariantSet("Mesh").SetVariantSelection("Quality")
         
         if self.registry_config:
             # 1. Apply Robot Pose
@@ -390,6 +411,9 @@ class IsaacSimRunner(BaseImageRunner):
                     episode_to_sampler_indices[ep_idx] = []
                 episode_to_sampler_indices[ep_idx].append(i)
             print(f"[IsaacSimRunner] Pre-indexed {len(episode_to_sampler_indices)} episodes from validation dataset for MSE calculation")
+        
+        if self.replay_gt and self.validation_dataset is None:
+             raise ValueError("replay_gt=True requires validation_dataset to be passed to IsaacSimRunner.")
 
         all_episode_stats = []
         
@@ -537,8 +561,11 @@ class IsaacSimRunner(BaseImageRunner):
                 print("[IsaacSimRunner] WARNING: Robot initialization IK failed!")
             
             # Short Settle after IK
-            for _ in range(10):
+            # Warm up rendering pipeline to avoid SyntheticData crash
+            print("[Debug] Warming up renderer...")
+            for _ in range(20):
                 self.world.step(render=True)
+            print("[Debug] Renderer warmed up.")
             # --------------------------------------------------------
             
             obs_buffer = collections.deque(maxlen=self.n_obs_steps)
@@ -635,47 +662,68 @@ class IsaacSimRunner(BaseImageRunner):
                 # -------------------------------------------------------------
 
                 
-                # Predict action
-                # print("[Debug] Predicting action...")
-                with torch.no_grad():
-                    action_dict = policy.predict_action(batch_obs)
-                # print("[Debug] Action predicted.")
+                # policy execution
+                if self.replay_gt:
+                    if dataset_ep_idx in episode_to_sampler_indices:
+                        sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                        
+                        # In Replay GT mode, we want to play EVERY frame from the dataset.
+                        # The sampler indices might be downsampled or truncated.
+                        # For now, we still use the indices but ensure we don't jump.
+                        if step_idx < len(sampler_indices):
+                            # Get GT action directly from dataset
+                            batch = self.validation_dataset[sampler_indices[step_idx]]
+                            actions = batch['action']
+                            if isinstance(actions, torch.Tensor):
+                                actions = actions.cpu().numpy()
+                            # Cache last action for padding
+                            self.last_gt_action = actions
+                            exec_steps = 1 # Force single step to see every frame
+                        else:
+                            # End of GT trajectory, stop the episode!
+                            print(f"[IsaacSimRunner] GT Replay finished for episode {episode_idx} (step {step_idx}). Stopping.")
+                            break
+                    else:
+                         print(f"[IsaacSimRunner] Warning: Episode {dataset_ep_idx} not found in validation dataset for GT replay!")
+                         actions = np.zeros((self.n_action_steps, 10))
+                         exec_steps = self.n_action_steps
+                else:
+                    with torch.no_grad():
+                        action_dict = policy.predict_action(batch_obs)
+                    actions = action_dict['action'][0].cpu().numpy() # [horizon, 10]
+                    exec_steps = self.n_action_steps
                 
-                # Execute action (n_action_steps)
-                # Action is (B=1, Horizon, D) -> (Horizon, D)
-                actions = action_dict['action'][0].cpu().numpy() # [horizon, 10]
+                # Execute action (n_action_steps or 1 for GT)
                 
-                # Get start pose for relative actions
+                # CRITICAL: Capture base pose for relative action application
+                # UMI actions in a chunk are all relative to the FIRST observation frame of that chunk.
+                
+                # FIX: Calibrate Solver Base Pose before computing EE pose!
+                # If we don't do this, the solver assumes base is at (0,0,0) which is wrong.
+                base_pos, base_quat = self.panda.get_world_pose()
+                self.lula_solver.set_robot_base_pose(robot_position=base_pos, robot_orientation=base_quat)
+                
                 current_ee_pos, current_ee_mat = self.art_kine_solver.compute_end_effector_pose()
                 current_ee_quat_xyzw = R.from_matrix(current_ee_mat[:3, :3]).as_quat()
-                current_ee_rot = R.from_quat(current_ee_quat_xyzw)
+                base_ee_rot = R.from_quat(current_ee_quat_xyzw)
+                base_ee_pos = current_ee_pos
 
-                for i in range(min(self.n_action_steps, len(actions))):
+                for i in range(min(exec_steps, len(actions))):
                     action = actions[i]
                     # action: [pos(3), rot6d(6), gripper(1)]
                     
-                    # Relative Position: Rotate by current and add
+                    # Relative Position: Rotate by base and add
                     delta_pos = action[:3]
-                    # Target = Current_Pos + Current_Rot * Delta_Pos (Apply delta in current local frame)
-                    target_pos = current_ee_pos + current_ee_rot.apply(delta_pos)
+                    # Target = Base_Pos + Base_Rot * Delta_Pos (Apply delta in reference frame)
+                    target_pos = base_ee_pos + base_ee_rot.apply(delta_pos)
 
-                    # Relative Rotation: Compose with current
+                    # Relative Rotation: Compose with base
                     delta_rot6d = action[3:9]
-                    # RotationTransformer.forward returns (x, y, z, w) because it uses scipy backend
                     delta_rot_quat_xyzw = self.rot_transformer.forward(delta_rot6d[None, :])[0] # shape (4,)
                     delta_rot = R.from_quat(delta_rot_quat_xyzw)
-                                        
-                    # DEBUG: Print Action Info
-                    d_pos_mag = np.linalg.norm(delta_pos)
-                    d_rot_mag = delta_rot.magnitude()
-                    d_rot_euler = delta_rot.as_euler('xyz', degrees=True)
-                    gripper_val = action[9]
                     
-                    if i == 0: # Print first action of the chunk
-                         print(f"[Debug Action] Step {step_idx}: Pos Mag={d_pos_mag:.4f}, Rot Mag={d_rot_mag:.4f}, Euler={d_rot_euler}, Grip={gripper_val:.4f}")
-                    
-                    # Target = Current * Delta (Apply delta in local frame)
-                    target_rot = current_ee_rot * delta_rot
+                    # target = base * delta
+                    target_rot = base_ee_rot * delta_rot
                     target_rot_quat_xyzw = target_rot.as_quat()
                     
                     # Target Orientation for IK (wxyz check: ArticulationKinematicsSolver expects wxyz?)
