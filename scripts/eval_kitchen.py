@@ -180,6 +180,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     val_mask = train_dataset.val_mask if hasattr(train_dataset, 'val_mask') else None
     if val_mask is not None:
         val_episode_indices = np.where(val_mask)[0].tolist()
+        zarr_episode_indices = val_episode_indices # Keep original Zarr indices
         n_val_episodes = len(val_episode_indices)
         total_episodes = len(val_mask)
         print(f"[Eval] Found {n_val_episodes} validation episodes out of {total_episodes} total episodes")
@@ -194,6 +195,7 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     else:
         print(f"[Eval] WARNING: Could not get validation mask from dataset. Using all episodes.")
         val_episode_indices = None
+        zarr_episode_indices = None
     
     # Calculate object_poses.json path and map original indices
     object_poses_path = None
@@ -229,7 +231,9 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
             print(f"[Eval] Mapping Zarr indices to original raw indices:")
             print(f"       Zarr: {val_episode_indices[:10]}...")
             print(f"       Raw:  {mapped_indices[:10]}...")
-            val_episode_indices = mapped_indices
+            simulation_episode_indices = mapped_indices
+        else:
+            simulation_episode_indices = val_episode_indices
 
         # 3. Locate object_poses.json
         potential_path = os.path.join(dataset_dir, 'demos', 'mapping', 'object_poses.json')
@@ -357,13 +361,18 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     if object_poses_path and 'object_poses_path' in sig.parameters:
         runner_kwargs['object_poses_path'] = object_poses_path
 
-    if val_episode_indices is not None and 'episode_indices' in sig.parameters:
+    if simulation_episode_indices is not None and 'episode_indices' in sig.parameters:
         # Limit to requested number of episodes
-        runner_kwargs['episode_indices'] = val_episode_indices[:n_episodes] if n_episodes else val_episode_indices
-        print(f"[Eval] Using validation episode indices: {runner_kwargs['episode_indices']}")
-    elif val_episode_indices is not None and 'val_episode_indices' in sig.parameters:
-        runner_kwargs['val_episode_indices'] = val_episode_indices[:n_episodes] if n_episodes else val_episode_indices
-        print(f"[Eval] Using validation episode indices: {runner_kwargs['val_episode_indices']}")
+        runner_kwargs['episode_indices'] = simulation_episode_indices[:n_episodes] if n_episodes else simulation_episode_indices
+        if zarr_episode_indices is not None and 'dataset_episode_indices' in sig.parameters:
+             runner_kwargs['dataset_episode_indices'] = zarr_episode_indices[:n_episodes] if n_episodes else zarr_episode_indices
+        
+        print(f"[Eval] Using simulation episode indices: {runner_kwargs['episode_indices']}")
+        if 'dataset_episode_indices' in runner_kwargs:
+            print(f"[Eval] Using dataset episode indices: {runner_kwargs['dataset_episode_indices']}")
+    elif simulation_episode_indices is not None and 'val_episode_indices' in sig.parameters:
+        runner_kwargs['val_episode_indices'] = simulation_episode_indices[:n_episodes] if n_episodes else simulation_episode_indices
+        print(f"[Eval] Using simulation episode indices: {runner_kwargs['val_episode_indices']}")
     
     # Override headless if runner accepts it
     if headless and 'headless' in sig.parameters:
@@ -372,6 +381,10 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
     # Ensure shape_meta is passed
     if 'shape_meta' in sig.parameters:
         runner_kwargs['shape_meta'] = cfg.shape_meta
+    
+    # Pass validation dataset for MSE calculation
+    if val_dataset is not None and 'validation_dataset' in sig.parameters:
+        runner_kwargs['validation_dataset'] = val_dataset
     
     # Instantiate env runner
     print(f"\n[Eval] Creating environment runner: {env_runner_cfg['_target_']}")
@@ -437,8 +450,9 @@ def main(checkpoint, output_dir, device, task, dataset_path, n_episodes, headles
         print(f"\n[Eval] Per-episode results:")
         for i, ep in enumerate(episode_stats):
             status = "✓" if ep.get('success', False) else "✗"
-            episode_idx = val_episode_indices[i] if val_episode_indices and i < len(val_episode_indices) else i
-            print(f"[Eval]   Episode {i+1} (dataset idx {episode_idx}): {status} (length: {ep.get('episode_length', 0)} steps)")
+            sim_idx = ep.get('episode_idx', i)
+            ds_idx = ep.get('dataset_episode_idx', sim_idx)
+            print(f"[Eval]   Episode {i+1} (sim idx {sim_idx}, ds idx {ds_idx}): {status} (length: {ep.get('episode_length', 0)} steps)")
     
     # Dump log to json
     json_log = dict()

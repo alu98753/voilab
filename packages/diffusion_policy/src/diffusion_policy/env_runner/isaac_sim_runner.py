@@ -43,6 +43,8 @@ class IsaacSimRunner(BaseImageRunner):
         use_recorded_poses: bool = True,
         object_poses_path: Optional[str] = None,
         episode_indices: Optional[List[int]] = None,
+        dataset_episode_indices: Optional[List[int]] = None,
+        validation_dataset: Optional[Any] = None,
         **kwargs
     ):
         super().__init__(output_dir)
@@ -58,6 +60,8 @@ class IsaacSimRunner(BaseImageRunner):
         self.use_recorded_poses = use_recorded_poses
         self.object_poses_path = object_poses_path
         self.episode_indices = episode_indices
+        self.dataset_episode_indices = dataset_episode_indices
+        self.validation_dataset = validation_dataset
 
         # Robot config
         self.franka_panda_usd = "/workspace/voilab/assets/franka_panda/franka_panda_arm.usd"
@@ -373,17 +377,36 @@ class IsaacSimRunner(BaseImageRunner):
         self._setup_simulation()
         device = policy.device
         
+        # Pre-calculate episode to sampler indices mapping for MSE calculation
+        episode_to_sampler_indices = {}
+        if self.validation_dataset is not None:
+            import bisect
+            dataset = self.validation_dataset
+            episode_ends = dataset.replay_buffer.episode_ends[:]
+            for i in range(len(dataset)):
+                _, _, end_idx, _ = dataset.sampler.indices[i]
+                ep_idx = bisect.bisect_left(episode_ends, end_idx)
+                if ep_idx not in episode_to_sampler_indices:
+                    episode_to_sampler_indices[ep_idx] = []
+                episode_to_sampler_indices[ep_idx].append(i)
+            print(f"[IsaacSimRunner] Pre-indexed {len(episode_to_sampler_indices)} episodes from validation dataset for MSE calculation")
+
         all_episode_stats = []
         
         
         # Determine episodes to run
         if self.episode_indices is not None:
             ep_indices = self.episode_indices
+            if self.dataset_episode_indices is not None:
+                dataset_ep_indices = self.dataset_episode_indices
+            else:
+                dataset_ep_indices = ep_indices # Fallback
         else:
             ep_indices = range(self.n_episodes)
+            dataset_ep_indices = ep_indices
         
-        for i, episode_idx in enumerate(ep_indices):
-            logger.info(f"[IsaacSimRunner] Starting episode {i+1}/{len(ep_indices)} (episode_idx: {episode_idx})")
+        for i, (episode_idx, dataset_ep_idx) in enumerate(zip(ep_indices, dataset_ep_indices)):
+            logger.info(f"[IsaacSimRunner] Starting episode {i+1}/{len(ep_indices)} (sim_idx: {episode_idx}, dataset_idx: {dataset_ep_idx})")
             self.world.reset()
             # Render once to get valid camera data
             self.world.step(render=True)
@@ -731,15 +754,58 @@ class IsaacSimRunner(BaseImageRunner):
                     out_front.release()
                     logger.info(f"[IsaacSimRunner] Saved front video to {video_path_front}")
 
+            # Calculate Dataset MSE for this episode
+            episode_mse = {}
+            if self.validation_dataset is not None and dataset_ep_idx in episode_to_sampler_indices:
+                sampler_indices = episode_to_sampler_indices[dataset_ep_idx]
+                from torch.utils.data import Subset, DataLoader
+                import torch.nn.functional as F
+                
+                ep_subset = Subset(self.validation_dataset, sampler_indices)
+                # Use 0 workers for stability within Isaac Sim environment
+                ep_loader = DataLoader(ep_subset, batch_size=32, num_workers=0)
+                
+                total_mse_stats = collections.defaultdict(float)
+                count = 0
+                
+                for batch in ep_loader:
+                    batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                    with torch.no_grad():
+                        # Predict action (open-loop)
+                        pred_action = policy.predict_action(batch['obs'])['action']
+                        gt_action = batch['action']
+                        
+                        # Calculate MSE details
+                        B, T, D = pred_action.shape
+                        pred_action = pred_action.view(B, T, -1, 10)
+                        gt_action = gt_action.view(B, T, -1, 10)
+                        
+                        mse = F.mse_loss(pred_action, gt_action, reduction='none')
+                        # Sum over all dims except batch
+                        total_mse_stats['mse'] += mse.mean().item() * B
+                        total_mse_stats['mse_pos'] += mse[..., :3].mean().item() * B
+                        total_mse_stats['mse_rot'] += mse[..., 3:9].mean().item() * B
+                        total_mse_stats['mse_width'] += mse[..., 9].mean().item() * B
+                        count += B
+                
+                if count > 0:
+                    for k in total_mse_stats:
+                        episode_mse[k] = total_mse_stats[k] / count
+                    
+                    print(f"[IsaacSimRunner] Episode {i+1} (idx {episode_idx}) Dataset MSE: {episode_mse['mse']:.6f} "
+                          f"(pos: {episode_mse['mse_pos']:.6f}, rot: {episode_mse['mse_rot']:.6f}, width: {episode_mse['mse_width']:.6f})")
+
             all_episode_stats.append({
                 'episode_idx': episode_idx,
-                'length': step_idx,
-                'success': is_success
+                'dataset_episode_idx': dataset_ep_idx,
+                'episode_length': step_idx,
+                'success': is_success,
+                'dataset_mse': episode_mse
             })
 
         print("[IsaacSimRunner] Evaluation complete.")
         success_rate = np.mean([s['success'] for s in all_episode_stats])
-        avg_length = np.mean([s['length'] for s in all_episode_stats])
+        avg_length = np.mean([s['episode_length'] for s in all_episode_stats])
         
         return {
             'episode_stats': all_episode_stats,
