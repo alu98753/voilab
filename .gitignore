@@ -227,6 +227,7 @@ video/demos/*
 **/*.csv
 **/*.osa
 **/*.json
+!blacklist_template.json
 **/*.zgroup
 **/*.zarray
 *.zarr.zip
