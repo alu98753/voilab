@@ -259,7 +259,10 @@ class IsaacSimRunner(BaseImageRunner):
 
     def set_registry_config(self, config: Dict):
         self.registry_config = config
-        print("[Debug] IsaacSimRunner: Registry config set.")
+        # Cache ArUco info for easy access in debug sessions
+        aruco_pose = config.get("aruco_tag_pose", {})
+        self.aruco_tag_translation = np.array(aruco_pose.get("translation", [4.9652, 2.45, 0.9]))
+        print(f"[Debug] IsaacSimRunner: Registry config set. ArUco at {self.aruco_tag_translation}")
 
     def _reset_robot_pose(self):
         """Applies registry-defined robot pose. Must be called after world.reset()."""
@@ -446,6 +449,7 @@ class IsaacSimRunner(BaseImageRunner):
         
         # Pre-load object poses JSON to match indices correctly
         object_poses_data = []
+        zarr_to_json = {}  # Mapping from Zarr episode index to JSON index
         if self.use_recorded_poses and self.object_poses_path and os.path.exists(self.object_poses_path):
             try:
                 import json
@@ -453,8 +457,18 @@ class IsaacSimRunner(BaseImageRunner):
                     object_poses_data = json.load(f)
                     if not isinstance(object_poses_data, list):
                         object_poses_data = [object_poses_data]
+                
+                # Build zarr_to_json mapping: only count 'full' status entries
+                # This matches generate_data.py which skips non-full entries
+                zarr_idx = 0
+                for json_idx, entry in enumerate(object_poses_data):
+                    if entry.get('status') == 'full':
+                        zarr_to_json[zarr_idx] = json_idx
+                        zarr_idx += 1
+                print(f"[IsaacSimRunner] Built zarr_to_json mapping: {len(zarr_to_json)} Zarr episodes -> {len(object_poses_data)} JSON entries")
             except Exception as e:
                 print(f"[IsaacSimRunner] WARNING: Failed to load object poses JSON: {e}")
+
         if self.replay_gt and self.validation_dataset is None:
             raise ValueError("replay_gt=True requires validation_dataset to be passed to IsaacSimRunner.")
 
@@ -492,16 +506,10 @@ class IsaacSimRunner(BaseImageRunner):
                     try:
                         from object_loader import load_object_transforms_from_json
                         
-                        # CORRECT INDEX MAPPING: Find the JSON entry that matches our RB frame range
-                        json_idx = episode_idx # Fallback
-                        if dataset_ep_idx in episode_to_sampler_indices:
-                            rb_start = episode_to_sampler_indices[dataset_ep_idx]['rb_range'][0]
-                            for j, entry in enumerate(object_poses_data):
-                                ep_range = entry.get('episode_range', [0, 0])
-                                if ep_range[0] <= rb_start < ep_range[1]:
-                                    json_idx = j
-                                    print(f"[IsaacSimRunner] Map dataset_idx {dataset_ep_idx} (start frame {rb_start}) -> JSON index {json_idx}")
-                                    break
+                        # CORRECT INDEX MAPPING: Use pre-built zarr_to_json table
+                        # This accounts for skipped JSON entries (status != 'full')
+                        json_idx = zarr_to_json.get(dataset_ep_idx, dataset_ep_idx)  # Fallback to same index
+                        print(f"[IsaacSimRunner] Map dataset_idx {dataset_ep_idx} -> JSON index {json_idx}")
 
                         object_transforms = load_object_transforms_from_json(
                             self.object_poses_path,
@@ -528,9 +536,8 @@ class IsaacSimRunner(BaseImageRunner):
                                            obj_name in self._normalize_object_name(prim_name) or \
                                            self._normalize_object_name(prim_name) in obj_name:
                                             obj_pos = np.array(obj["position"], dtype=np.float64)
-                                            # FIX: Only apply position to match generate_data.py behavior (keeps cups upright)
                                             self.object_prims[prim_name].set_world_pose(position=obj_pos)
-                                            print(f"[IsaacSimRunner] Positioned {prim_name} at {obj_pos} (fuzzy match with {obj_name}, orientation maintained)")
+                                            print(f"[IsaacSimRunner] Positioned {prim_name} at {obj_pos} (fuzzy match)")
                                             matched = True
                                             break
                                     if not matched:
@@ -541,34 +548,6 @@ class IsaacSimRunner(BaseImageRunner):
                         print(f"[IsaacSimRunner] ERROR loading recorded poses: {e}")
                         import traceback
                         traceback.print_exc()
-                        # Fallback to random mode if JSON loading fails? Or just continue?
-                
-                # OPTION B: Random Jitter (Fallback or Explicitly requested)
-                else:
-                    print(f"[IsaacSimRunner] Using random jitter mode for episode {episode_idx}")
-                    # Seed for reproducibility per episode
-                    rng = np.random.default_rng(episode_idx)
-                    
-                    # Disable Randomization for Debugging (Set to 0.0)
-                    jitter_scale = 0.0 
-                    
-                    # Pink Cup
-                    if 'pink cup' in self.object_prims:
-                        # Base: [4.85, 2.60, 1.0] -> Move to [5.00, 2.60] (Closer to Robot X=4.99)
-                        jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                        pos = np.array([4.70 + jitter[0], 2.60 + jitter[1], 1.0]) 
-                        quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                        self.object_prims['pink cup'].set_world_pose(position=pos, orientation=quat)
-                        print(f"[IsaacSimRunner] Reset pink cup to {pos} (Fixed)")
-                    
-                    # Blue Cup
-                    if 'blue cup' in self.object_prims:
-                         # Base: [4.85, 2.80, 1.0] -> Move to [5.00, 2.80]
-                        jitter = rng.uniform(-jitter_scale, jitter_scale, size=2)
-                        pos = np.array([4.99 + jitter[0], 2.52 + jitter[1], 1.0])
-                        quat = np.array([1, 0, 0, 0]) # Upright (WXYZ)
-                        self.object_prims['blue cup'].set_world_pose(position=pos, orientation=quat)
-                        print(f"[IsaacSimRunner] Reset blue cup to {pos} (Fixed)")
 
             # --- 2. Settle Physics (Match generate_data.py Phase 2) ---
             print("[Debug] Settling physics for 100 steps...")
